@@ -2,6 +2,7 @@
 
 import itertools
 import logging
+from typing import AbstractSet, Dict
 
 from pytype.pytd import booleq
 from pytype.pytd import escape
@@ -85,7 +86,7 @@ class TypeSolver:
     subst = {p.type_param: pytd.AnythingType() for p in complete.template}
     formula = matcher.match_Class_against_Class(partial, complete, subst)
     if formula is booleq.FALSE:
-      raise FlawedQuery("%s can never be %s" % (partial.name, complete.name))
+      raise FlawedQuery(f"{partial.name} can never be {complete.name}")
     solver.always_true(formula)
 
   def match_call_record(self, matcher, solver, call_record, complete):
@@ -104,7 +105,7 @@ class TypeSolver:
           break
       else:
         faulty_signature = ""
-      raise FlawedQuery("Bad call\n%s%s\nagainst:\n%s" % (
+      raise FlawedQuery("Bad call\n{}{}\nagainst:\n{}".format(
           escape.unpack_partial(call_record.name),
           faulty_signature, pytd_utils.Print(complete)))
     solver.always_true(formula)
@@ -288,13 +289,12 @@ def convert_pytd(ast, builtins_pytd, protocols_pytd):
   return result
 
 
-def log_info_mapping(mapping):
+def log_info_mapping(mapping: Dict[str, AbstractSet[str]]) -> None:
   """Print a raw type mapping. For debugging."""
   if log.isEnabledFor(logging.DEBUG):
     cutoff = 12
     log.debug("=========== (possible types) ===========")
     for unknown, possible_types in sorted(mapping.items()):
-      assert isinstance(possible_types, (set, frozenset))
       if len(possible_types) > cutoff:
         log.debug("%s can be   %s, ... (total: %d)", unknown,
                   ", ".join(sorted(possible_types)[0:cutoff]),

@@ -19,6 +19,7 @@ class BuiltinTests(test_base.BaseTest):
       def t_testRepr1(x: int) -> str: ...
     """)
 
+  @test_base.skip("b/238794928: Function inference will be removed.")
   def test_repr2(self):
     ty = self.Infer("""
       def t_testRepr2(x):
@@ -266,6 +267,7 @@ class BuiltinTests(test_base.BaseTest):
     def t_testCmp(x, y) -> int: ...
     """)
 
+  @test_base.skip("b/238794928: Function inference will be removed.")
   def test_cmp_multi(self):
     ty = self.Infer("""
       def t_testCmpMulti(x, y):
@@ -326,7 +328,7 @@ class BuiltinTests(test_base.BaseTest):
     ty = self.Infer("""
       import signal
       def f():
-        signal.signal(signal.SIGALRM, 0)
+        signal.signal(signal.SIGTERM, 0)
     """)
     self.assertTypesMatchPytd(ty, """
       import signal

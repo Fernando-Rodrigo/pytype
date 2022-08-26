@@ -154,10 +154,10 @@ class _Eq(BooleanTerm):
     self.right = right
 
   def __repr__(self):
-    return "Eq(%r, %r)" % (self.left, self.right)
+    return f"Eq({self.left!r}, {self.right!r})"
 
   def __str__(self):
-    return "%s == %s" % (self.left, self.right)
+    return f"{self.left} == {self.right}"
 
   def __hash__(self):
     return hash((self.left, self.right))
@@ -233,7 +233,7 @@ class _And(BooleanTerm):
     return not self == other
 
   def __repr__(self):
-    return "And(%r)" % list(self.exprs)
+    return f"And({list(self.exprs)!r})"
 
   def __str__(self):
     return "(" + " & ".join(str(t) for t in self.exprs) + ")"
@@ -284,7 +284,7 @@ class _Or(BooleanTerm):
     return not self == other
 
   def __repr__(self):
-    return "Or(%r)" % list(self.exprs)
+    return f"Or({list(self.exprs)!r})"
 
   def __str__(self):
     return "(" + " | ".join(str(t) for t in self.exprs) + ")"
@@ -312,7 +312,7 @@ class _Or(BooleanTerm):
     return tuple(chain(expr.extract_equalities() for expr in self.exprs))
 
 
-def Eq(left, right):  # pylint: disable=invalid-name
+def Eq(left: str, right: str) -> BooleanTerm:  # pylint: disable=invalid-name
   """Create an equality or its simplified equivalent.
 
   This will ensure that left > right. (For left == right, it'll just return
@@ -327,14 +327,12 @@ def Eq(left, right):  # pylint: disable=invalid-name
   Returns:
     A BooleanTerm.
   """
-  assert isinstance(left, str)
-  assert isinstance(right, str)
   if left == right:
     return TRUE
   elif left > right:
     return _Eq(left, right)
   else:
-    return _Eq(right, left)
+    return _Eq(right, left)  # pylint: disable=arguments-out-of-order
 
 
 def And(exprs):  # pylint: disable=invalid-name
@@ -384,12 +382,12 @@ class Solver:
   Attributes:
     ANY_VALUE: A special value assigned to variables with no constraints.
     variables: A list of all variables.
-    values: A list of all values.
     implications: A nested dictionary mapping variable names to values to
       BooleanTerm instances. This is used to specify rules like "if x is 1,
       then ..."
-    ground_truths: An equation that needs to always be TRUE. If this is FALSE,
+    ground_truth: An equation that needs to always be TRUE. If this is FALSE,
       or can be reduced to FALSE, the system is unsolvable.
+    assignments: The solutions, a mapping of variables to values.
   """
 
   ANY_VALUE = "?"
@@ -404,7 +402,7 @@ class Solver:
     lines = []
     count_false, count_true = 0, 0
     if self.ground_truth is not TRUE:
-      lines.append("always: %s" % (self.ground_truth,))
+      lines.append(f"always: {self.ground_truth}")
     for var, value, implication in self._iter_implications():
       # only print the "interesting" lines
       if implication is FALSE:
@@ -412,18 +410,18 @@ class Solver:
       elif implication is TRUE:
         count_true += 1
       else:
-        lines.append("if %s then %s" % (_Eq(var, value), implication))
+        lines.append(f"if {_Eq(var, value)} then {implication}")
     return "%s\n(not shown: %d always FALSE, %d always TRUE)\n" % (
         "\n".join(lines), count_false, count_true)
 
   def __repr__(self):
     lines = []
     for var in self.variables:
-      lines.append("solver.register_variable(%r)" % var)
+      lines.append(f"solver.register_variable({var!r})")
     if self.ground_truth is not TRUE:
-      lines.append("solver.always_true(%r)" % (self.ground_truth,))
+      lines.append(f"solver.always_true({self.ground_truth!r})")
     for var, value, implication in self._iter_implications():
-      lines.append("solver.implies(%r, %r)" % (_Eq(var, value), implication))
+      lines.append(f"solver.implies({_Eq(var, value)!r}, {implication!r})")
     return "\n" + "".join(line + "\n" for line in lines)
 
   def register_variable(self, variable):
@@ -435,7 +433,7 @@ class Solver:
     assert formula is not FALSE
     self.ground_truth = And([self.ground_truth, formula])
 
-  def implies(self, e, implication):
+  def implies(self, e: BooleanTerm, implication: BooleanTerm) -> None:
     """Register an implication. Call before calling solve()."""
     # COV_NF_START
     if e is FALSE or e is TRUE:
@@ -453,8 +451,8 @@ class Solver:
         yield (var, value, implication)
 
   def _get_nonfalse_values(self, var):
-    return set(value for value, implication in self.implications[var].items()
-               if implication is not FALSE)
+    return {value for value, implication in self.implications[var].items()
+            if implication is not FALSE}
 
   def _get_first_approximation(self):
     """Get all (variable, value) combinations to consider.
@@ -563,8 +561,8 @@ class Solver:
           length_after = len(assignments[pivot])
           something_changed |= (length_before != length_after)
 
-    self.register_variable = pytd_utils.disabled_function
-    self.implies = pytd_utils.disabled_function
+    self.register_variable = pytd_utils.disabled_function  # pylint: disable=g-missing-from-attributes
+    self.implies = pytd_utils.disabled_function  # pylint: disable=g-missing-from-attributes
 
     self.assignments = assignments
     return assignments

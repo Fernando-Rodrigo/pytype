@@ -1,7 +1,7 @@
 """Tests for handling PYI code."""
 
-from pytype import file_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class PYITest(test_base.BaseTest):
@@ -20,7 +20,7 @@ class PYITest(test_base.BaseTest):
         """)
 
   def test_static_method_from_pyi_as_callable(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         class A:
           @staticmethod
@@ -35,7 +35,7 @@ class PYITest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_class_method_from_pyi_as_callable(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         class A:
           @classmethod
@@ -50,7 +50,7 @@ class PYITest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_ellipsis(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: Ellipsis) -> None: ...
       """)
@@ -61,7 +61,7 @@ class PYITest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_resolve_nested_type(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("meta.pyi", """
         class Meta(type): ...
       """)
@@ -77,7 +77,7 @@ class PYITest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_partial_forward_reference(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Generic, TypeVar
         X1 = list['Y']
@@ -99,7 +99,7 @@ class PYITestPython3Feature(test_base.BaseTest):
   """Tests for PYI."""
 
   def test_bytes(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f() -> bytes: ...
       """)
@@ -110,25 +110,6 @@ class PYITestPython3Feature(test_base.BaseTest):
       self.assertTypesMatchPytd(ty, """
         import foo
         x = ...  # type: bytes
-      """)
-
-  def test_collections_abc_callable(self):
-    with file_utils.Tempdir() as d:
-      d.create_file("foo.pyi", """
-        from collections.abc import Callable
-        def f() -> Callable[[], float]: ...
-      """)
-      ty, _ = self.InferWithErrors("""
-        import foo
-        func = foo.f()
-        func(0.0)  # wrong-arg-count
-        x = func()
-      """, pythonpath=[d.path])
-      self.assertTypesMatchPytd(ty, """
-        import foo
-        from typing import Callable
-        func: Callable[[], float]
-        x: float
       """)
 
   def test_imported_literal_alias(self):
@@ -185,7 +166,7 @@ class PYITestAnnotated(test_base.BaseTest):
     """)
 
   def test_invalid_pytype_metadata(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Annotated
         x: Annotated[int, "pytype_metadata", 2]
@@ -195,6 +176,34 @@ class PYITestAnnotated(test_base.BaseTest):
         a = foo.x  # invalid-annotation[e]
       """, pythonpath=[d.path])
       self.assertErrorSequences(err, {"e": ["pytype_metadata"]})
+
+
+class PYITestAll(test_base.BaseTest):
+  """Tests for __all__."""
+
+  def test_star_import(self):
+    with self.DepTree([("foo.pyi", """
+      import datetime
+      __all__ = ['f', 'g']
+      def f(x): ...
+      def h(x): ...
+    """), ("bar.pyi", """
+      from foo import *
+    """)]):
+      self.CheckWithErrors("""
+        import bar
+        a = bar.datetime  # module-attr
+        b = bar.f(1)
+        c = bar.h(1)  # module-attr
+      """)
+
+  def test_http_client(self):
+    """Check that we can get unexported symbols from http.client."""
+    self.Check("""
+      from http import client
+      from six.moves import http_client
+      status = http_client.FOUND or client.FOUND
+    """)
 
 
 if __name__ == "__main__":

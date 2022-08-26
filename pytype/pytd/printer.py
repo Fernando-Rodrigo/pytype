@@ -41,21 +41,18 @@ class PrintVisitor(base_visitor.Visitor):
   def Print(self, node):
     return node.Visit(copy.deepcopy(self))
 
-  def _IsEmptyTuple(self, t):
+  def _IsEmptyTuple(self, t: pytd.GenericType) -> bool:
     """Check if it is an empty tuple."""
-    assert isinstance(t, pytd.GenericType)
     return isinstance(t, pytd.TupleType) and not t.parameters
 
-  def _NeedsTupleEllipsis(self, t):
+  def _NeedsTupleEllipsis(self, t: pytd.GenericType) -> bool:
     """Do we need to use Tuple[x, ...] instead of Tuple[x]?"""
-    assert isinstance(t, pytd.GenericType)
     if isinstance(t, pytd.TupleType):
       return False  # TupleType is always heterogeneous.
     return t.base_type == "tuple"
 
-  def _NeedsCallableEllipsis(self, t):
+  def _NeedsCallableEllipsis(self, t: pytd.GenericType) -> bool:
     """Check if it is typing.Callable type."""
-    assert isinstance(t, pytd.GenericType)
     return t.name == "typing.Callable"
 
   def _RequireImport(self, module, name=None):
@@ -184,10 +181,13 @@ class PrintVisitor(base_visitor.Visitor):
     # before from-import statements.
     imports = sorted(imports, key=lambda s: (s.startswith("from "), s))
 
+    # Remove deleted constants
+    constants = [c for c in node.constants if "<deleted>" not in c]
+
     sections = [
         imports,
         aliases,
-        node.constants,
+        constants,
         self._FormatTypeParams(self.old_node.type_params),
         node.classes,
         node.functions,
@@ -206,6 +206,20 @@ class PrintVisitor(base_visitor.Visitor):
   def LeaveConstant(self, node):
     self.in_constant = False
 
+  def _DropTypingConstant(self, node):
+    # Hack to account for a corner case in late annotation handling.
+    # If we have a top-level constant of the exact form
+    #   Foo: Type[typing.Foo]
+    # we drop the constant and rewrite it to
+    #   from typing import Foo
+    if self.class_names or node.value:
+      return False
+    if node.type == f"Type[typing.{node.name}]":
+      self._RequireImport("typing", node.name)
+      self._typing_import_counts["Type"] -= 1
+      del self._local_names[node.name]
+      return True
+
   def VisitConstant(self, node):
     """Convert a class-level or module-level constant to a string."""
     if self.in_literal:
@@ -219,6 +233,8 @@ class PrintVisitor(base_visitor.Visitor):
     # Decrement Any, since the actual value is never printed.
     if node.value == "Any":
       self._typing_import_counts["Any"] -= 1
+    if self._DropTypingConstant(node):
+      return "<deleted>"
     # Whether the constant has a default value is important for fields in
     # generated classes like namedtuples.
     suffix = " = ..." if node.value else ""
@@ -251,7 +267,7 @@ class PrintVisitor(base_visitor.Visitor):
     """Entering a class - record class name for children's use."""
     n = node.name
     if node.template:
-      n += "[{}]".format(", ".join(self.Print(t) for t in node.template))
+      n += f"[{', '.join(self.Print(t) for t in node.template)}]"
     for member in node.methods + node.constants:
       self._class_members.add(member.name)
     self.class_names.append(n)
@@ -330,9 +346,8 @@ class PrintVisitor(base_visitor.Visitor):
                            for sig in node.signatures)
     return signatures
 
-  def _FormatContainerContents(self, node):
+  def _FormatContainerContents(self, node: pytd.Parameter) -> str:
     """Print out the last type parameter of a container. Used for *args/**kw."""
-    assert isinstance(node, pytd.Parameter)
     if isinstance(node.type, pytd.GenericType):
       container_name = node.type.name.rpartition(".")[2]
       assert container_name in ("tuple", "dict")
@@ -398,22 +413,19 @@ class PrintVisitor(base_visitor.Visitor):
                       if p.mutated_type is not None]
     # pylint: enable=no-member
     for name, new_type in mutable_params:
-      body.append("\n{indent}{name} = {new_type}".format(
-          indent=self.INDENT, name=name, new_type=self.Print(new_type)))
+      body.append(f"\n{self.INDENT}{name} = {self.Print(new_type)}")
     for exc in node.exceptions:
-      body.append("\n{indent}raise {exc}()".format(indent=self.INDENT, exc=exc))
+      body.append(f"\n{self.INDENT}raise {exc}()")
     if not body:
       body.append(" ...")
 
     if self.multiline_args:
       indent = "\n" + self.INDENT
       params = ",".join([indent + p for p in params])
-      return "({params}\n){ret}:{body}".format(
-          params=params, ret=ret, body="".join(body))
+      return f"({params}\n){ret}:{''.join(body)}"
     else:
       params = ", ".join(params)
-      return "({params}){ret}:{body}".format(
-          params=params, ret=ret, body="".join(body))
+      return f"({params}){ret}:{''.join(body)}"
 
   def EnterParameter(self, unused_node):
     assert not self.in_parameter
@@ -441,7 +453,7 @@ class PrintVisitor(base_visitor.Visitor):
             self._typing_import_counts[k] -= 1
       return node.name + suffix
     elif node.name == "cls" and self.class_names and (
-        node.type == "Type[%s]" % self.class_names[-1]):
+        node.type == f"Type[{self.class_names[-1]}]"):
       self._typing_import_counts["Type"] -= 1
       return node.name + suffix
     elif node.type is None:
@@ -624,7 +636,7 @@ class PrintVisitor(base_visitor.Visitor):
       else:
         new_type_list.append(t)
     if literals:
-      new_type_list.append("Literal[%s]" % ", ".join(literals))
+      new_type_list.append(f"Literal[{', '.join(literals)}]")
     if len(new_type_list) == 1:
       return new_type_list[0]
     elif "None" in new_type_list:

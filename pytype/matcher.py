@@ -3,7 +3,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from pytype import datatypes
 from pytype import special_builtins
@@ -16,6 +16,7 @@ from pytype.overlays import typed_dict
 from pytype.overlays import typing_overlay
 from pytype.pytd import pep484
 from pytype.pytd import pytd_utils
+from pytype.typegraph import cfg
 
 
 log = logging.getLogger(__name__)
@@ -25,6 +26,8 @@ _COMPATIBLE_BUILTINS = [
     ("builtins." + compatible_builtin, "builtins." + builtin)
     for compatible_builtin, builtin in pep484.COMPAT_ITEMS
 ]
+
+_SubstType = Dict[str, cfg.Variable]
 
 
 def _is_callback_protocol(typ):
@@ -81,6 +84,23 @@ class ErrorDetails:
   typed_dict: Optional[TypedDictError] = None
 
 
+@dataclasses.dataclass(eq=True, frozen=True)
+class BadMatch:
+  """An expected type/actual value mismatch."""
+
+  view: Dict[cfg.Variable, cfg.Binding]
+  expected: abstract_utils.BadType
+  actual: cfg.Variable
+
+  @property
+  def actual_binding(self):
+    return self.view[self.actual]
+
+  @property
+  def error_details(self):
+    return self.expected.error_details
+
+
 class AbstractMatcher(utils.ContextWeakrefMixin):
   """Matcher for abstract values."""
 
@@ -89,10 +109,13 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
     self._node = node
     self._protocol_cache = set()
     self._recursive_annots_cache = set()
+    self._error_subst = None
+    self._reset_errors()
+
+  def _reset_errors(self):
     self._protocol_error = None
     self._noniterable_str_error = None
     self._typed_dict_error = None
-    self._error_subst = None
 
   @contextlib.contextmanager
   def _track_partially_matched_protocols(self):
@@ -117,6 +140,15 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
         noniterable_str=self._noniterable_str_error,
         typed_dict=self._typed_dict_error
     )
+
+  def _get_bad_type(
+      self, name: Optional[str], expected: abstract.BaseValue
+  ) -> abstract_utils.BadType:
+    return abstract_utils.BadType(
+        name=name,
+        typ=self.ctx.annotation_utils.sub_one_annotation(
+            self._node, expected, [self._error_subst or {}]),
+        error_details=self._error_details())
 
   def compute_subst(self, formal_args, arg_dict, view, alias_map=None):
     """Compute information about type parameters using one-way unification.
@@ -143,19 +175,14 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
     subst = datatypes.AliasingDict()
     if alias_map:
       subst.uf = alias_map
-    self._protocol_error = None
-    self._noniterable_str_error = None
     self._error_subst = None
     self_subst = None
     for name, formal in formal_args:
+      self._reset_errors()
       actual = arg_dict[name]
       subst = self._match_value_against_type(actual, formal, subst, view)
       if subst is None:
-        formal = self.ctx.annotation_utils.sub_one_annotation(
-            self._node, formal, [self._error_subst or {}])
-
-        return None, function.BadParam(
-            name=name, expected=formal, error_details=self._error_details())
+        return None, self._get_bad_type(name, formal)
       if name == "self":
         self_subst = subst
     if self_subst:
@@ -168,21 +195,22 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
           subst[name] = value
     return datatypes.HashableDict(subst), None
 
-  def bad_matches(self, var, other_type):
+  def bad_matches(
+      self, var, other_type, name=None
+  ) -> Tuple[List[BadMatch], List[Dict[str, cfg.Variable]]]:
     """Match a Variable against a type. Return views that don't match.
 
     Args:
       var: A cfg.Variable, containing instances.
       other_type: An instance of BaseValue.
+      name: Optionally, the variable name.
     Returns:
-      A list of all the views of var that didn't match.
+      A pair of:
+      * A list of all bad matches.
+      * Substitution dictionaries for good matches.
     """
     bad = []
-    if (var.data == [self.ctx.convert.unsolvable] or
-        other_type == self.ctx.convert.unsolvable):
-      # An unsolvable matches everything. Since bad_matches doesn't need to
-      # compute substitutions, we can return immediately.
-      return bad
+    substs = []
     views = abstract_utils.get_views([var], self._node)
     skip_future = None
     while True:
@@ -190,17 +218,20 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
         view = views.send(skip_future)
       except StopIteration:
         break
-      self._protocol_error = None
-      self._noniterable_str_error = None
-      if self.match_var_against_type(var, other_type, {}, view) is None:
+      subst = self.match_var_against_type(var, other_type, {}, view)
+      if subst is None:
         if self._node.HasCombination(list(view.values())):
-          bad.append((view, self._error_details()))
+          bad.append(BadMatch(
+              view=view,
+              expected=self._get_bad_type(name, other_type),
+              actual=var))
         # To get complete error messages, we need to collect all bad views, so
         # we can't skip any.
         skip_future = False
       else:
         skip_future = True
-    return bad
+        substs.append(datatypes.HashableDict(subst))
+    return bad, substs
 
   def match_from_mro(self, left, other_type, allow_compat_builtins=True):
     """Checks a type's MRO for a match for a formal type.
@@ -244,6 +275,7 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
 
   def match_var_against_type(self, var, other_type, subst, view):
     """Match a variable against a type."""
+    self._reset_errors()
     if var.bindings:
       return self._match_value_against_type(view[var], other_type, subst, view)
     else:  # Empty set of values. The "nothing" type.
@@ -289,7 +321,10 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
           return None  # a constraint option isn't allowed by the bound
     return subst
 
-  def _match_value_against_type(self, value, other_type, subst, view):
+  def _match_value_against_type(
+      self, value: cfg.Binding, other_type: abstract.BaseValue,
+      subst: _SubstType, view: Dict[cfg.Variable, cfg.Binding]
+  ) -> Optional[_SubstType]:
     """One-way unify value into pytd type given a substitution.
 
     Args:
@@ -302,8 +337,6 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
       succeeded, None otherwise.
     """
     left = value.data
-    assert isinstance(left, abstract.BaseValue), left
-    assert isinstance(other_type, abstract.BaseValue), other_type
 
     # Unwrap Final[T] here
     left = abstract_utils.unwrap_final(left)
@@ -814,7 +847,7 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
       return None
     else:
       raise NotImplementedError(
-          "Can't match %r against %r" % (left, other_type))
+          f"Can't match {left!r} against {other_type!r}")
 
   def _match_instance(self, left, instance, other_type, subst, view):
     """Used by _match_instance_against_type. Matches one MRO entry.
@@ -977,9 +1010,9 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
         return None
     return subst
 
-  def _match_dict_against_typed_dict(self, left, other_type):
-    assert isinstance(other_type, typed_dict.TypedDictClass)
-    self._typed_dict_error = None
+  def _match_dict_against_typed_dict(
+      self, left: abstract.BaseValue, other_type: typed_dict.TypedDictClass
+  ) -> bool:
     if not isinstance(left, abstract.Dict):
       return False
     missing, extra = other_type.props.check_keys(left.pyval.keys())
@@ -989,9 +1022,9 @@ class AbstractMatcher(utils.ContextWeakrefMixin):
       if k not in fields:
         continue
       typ = abstract_utils.get_atomic_value(fields[k])
-      b = self.bad_matches(v, typ)
+      b, _ = self.bad_matches(v, typ)
       if b:
-        bad.append((k, v, typ, b))
+        bad.append((k, b))
     if missing or extra or bad:
       self._typed_dict_error = TypedDictError(bad, extra, missing)
       return False

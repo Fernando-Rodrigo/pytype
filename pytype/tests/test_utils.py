@@ -2,21 +2,74 @@
 
 import collections
 import copy
+import dataclasses
 import io
+import os
 import re
+import shutil
 import sys
+import textwrap
 import tokenize
 
 from pytype import context
 from pytype import load_pytd
 from pytype import state as frame_state
+from pytype.file_utils import makedirs
+from pytype.platform_utils import path_utils
+from pytype.platform_utils import tempfile as compatible_tempfile
 from pytype.pyc import loadmarshal
 from pytype.pyc import opcodes
 
 import unittest
 
 
-FakeCode = collections.namedtuple("FakeCode", "co_filename co_name")
+class Tempdir:
+  """Context handler for creating temporary directories."""
+
+  def __enter__(self):
+    self.path = compatible_tempfile.mkdtemp()
+    return self
+
+  def create_directory(self, filename):
+    """Create a subdirectory in the temporary directory."""
+    path = path_utils.join(self.path, filename)
+    makedirs(path)
+    return path
+
+  def create_file(self, filename, indented_data=None):
+    """Create a file in the temporary directory. Dedents the data if needed."""
+    filedir, filename = path_utils.split(filename)
+    if filedir:
+      self.create_directory(filedir)
+    path = path_utils.join(self.path, filedir, filename)
+    if isinstance(indented_data, bytes):
+      # This is binary data rather than text.
+      mode = "wb"
+      data = indented_data
+    else:
+      mode = "w"
+      data = textwrap.dedent(indented_data) if indented_data else indented_data
+    with open(path, mode) as fi:
+      if data:
+        fi.write(data)
+    return path
+
+  def delete_file(self, filename):
+    os.unlink(path_utils.join(self.path, filename))
+
+  def __exit__(self, error_type, value, tb):
+    shutil.rmtree(path=self.path)
+    return False  # reraise any exceptions
+
+  def __getitem__(self, filename):
+    """Get the full path for an entry in this directory."""
+    return path_utils.join(self.path, filename)
+
+
+@dataclasses.dataclass(eq=True, frozen=True)
+class FakeCode:
+  co_filename: str
+  co_name: str
 
 
 class FakeOpcode:
@@ -50,18 +103,18 @@ class OperatorsTestMixin:
 
     # Join the assignments with ";" to avoid figuring out the exact indentation:
     assignments = "; ".join(assignments)
-    src = """
+    src = f"""
       def f():
         {assignments}
         return {expr}
       f()
-    """.format(expr=expr, assignments=assignments)
+    """
     ty = self.Infer(src, deep=False)
     self.assertOnlyHasReturnType(ty.Lookup("f"), expected_return)
 
   def check_binary(self, function_name, op):
     """Check the binary operator."""
-    ty = self.Infer("""
+    ty = self.Infer(f"""
       class Foo:
         def {function_name}(self, unused_x):
           return 3j
@@ -70,21 +123,21 @@ class OperatorsTestMixin:
       def f():
         return Foo() {op} Bar()
       f()
-    """.format(function_name=function_name, op=op),
+    """,
                     deep=False,
                     show_library_calls=True)
     self.assertOnlyHasReturnType(ty.Lookup("f"), self.complex)
 
   def check_unary(self, function_name, op, ret=None):
     """Check the unary operator."""
-    ty = self.Infer("""
+    ty = self.Infer(f"""
       class Foo:
         def {function_name}(self):
           return 3j
       def f():
         return {op} Foo()
       f()
-    """.format(function_name=function_name, op=op),
+    """,
                     deep=False,
                     show_library_calls=True)
     self.assertOnlyHasReturnType(ty.Lookup("f"), ret or self.complex)
@@ -117,7 +170,7 @@ class OperatorsTestMixin:
 
   def check_inplace(self, function_name, op):
     """Check the inplace operator."""
-    ty = self.Infer("""
+    ty = self.Infer(f"""
       class Foo:
         def __{function_name}__(self, x):
           return 3j
@@ -126,7 +179,7 @@ class OperatorsTestMixin:
         x {op} None
         return x
       f()
-    """.format(op=op, function_name=function_name),
+    """,
                     deep=False,
                     show_library_calls=True)
     self.assertHasReturnType(ty.Lookup("f"), self.complex)
@@ -140,13 +193,13 @@ class InplaceTestMixin:
   def _check_inplace(self, op, assignments, expected_return):
     """Check the inplace operator."""
     assignments = "; ".join(assignments)
-    src = """
+    src = f"""
       def f(x, y):
         {assignments}
         x {op}= y
         return x
       a = f(1, 2)
-    """.format(assignments=assignments, op=op)
+    """
     ty = self.Infer(src, deep=False)
     self.assertTypeEquals(ty.Lookup("a").type, expected_return)
 
@@ -157,12 +210,12 @@ class TestCollectionsMixin:
   _HAS_DYNAMIC_ATTRIBUTES = True
 
   def _testCollectionsObject(self, obj, good_arg, bad_arg, error):  # pylint: disable=invalid-name
-    result = self.CheckWithErrors("""
+    result = self.CheckWithErrors(f"""
       import collections
       def f(x: collections.{obj}): ...
       f({good_arg})
       f({bad_arg})  # wrong-arg-types[e]
-    """.format(obj=obj, good_arg=good_arg, bad_arg=bad_arg))
+    """)
     self.assertErrorRegexes(result, {"e": error})
 
 
@@ -253,7 +306,7 @@ class ErrorMatcher:
     def _format_error(line, code, mark=None):
       formatted = "Line %d: %s" % (line, code)
       if mark:
-        formatted += "[%s]" % mark
+        formatted += f"[{mark}]"
       return formatted
 
     self.errorlog = errorlog
@@ -273,10 +326,11 @@ class ErrorMatcher:
           code, mark = errs[0]
           exp = _format_error(error.lineno, code, mark)
           actual = _format_error(error.lineno, error.name)
-          self._fail("Error does not match:\nExpected: %s\nActual: %s" %
-                     (exp, actual))
+          self._fail(
+              f"Error does not match:\nExpected: {exp}\nActual: {actual}"
+          )
         else:
-          self._fail("Unexpected error:\n%s" % error)
+          self._fail(f"Unexpected error:\n{error}")
     leftover_errors = []
     for line in sorted(expected):
       leftover_errors.extend(_format_error(line, code, mark)
@@ -291,12 +345,12 @@ class ErrorMatcher:
       try:
         matcher = matchers.pop(mark)
       except KeyError:
-        self._fail("No matcher for mark %s" % mark)
+        self._fail(f"No matcher for mark {mark}")
       if not matcher.match(error.message):
         self._fail("Bad error message for mark %s: expected %r, got %r" %
                    (mark, matcher, error.message))
     if matchers:
-      self._fail("Marks not found in code: %s" % ", ".join(matchers))
+      self._fail(f"Marks not found in code: {', '.join(matchers)}")
 
   def assert_error_regexes(self, expected_regexes):
     matchers = {k: RegexMatcher(v) for k, v in expected_regexes.items()}
@@ -321,7 +375,7 @@ class ErrorMatcher:
           mark = match.group("mark")
           if mark:
             if mark in used_marks:
-              self._fail("Mark %s already used" % mark)
+              self._fail(f"Mark {mark} already used")
             used_marks.add(mark)
           expected[line].append((match.group("code"), mark))
     return expected
@@ -356,6 +410,10 @@ def skipBeforePy(version, reason):
 
 def skipFromPy(version, reason):
   return unittest.skipUnless(sys.version_info[:2] < version, reason)
+
+
+def skipOnWin32(reason):
+  return unittest.skipIf(sys.platform == "win32", reason)
 
 
 def make_context(options):

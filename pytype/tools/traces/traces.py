@@ -169,12 +169,18 @@ class MatchAstVisitor(visitor.BaseVisitor):
     return match(node)
 
   def match_Attribute(self, node):
+    if hasattr(node, "end_lineno"):
+      n = node.end_lineno - node.lineno + 1
+    else:
+      n = 1
+    trs = self._get_traces(
+        node.lineno, _ATTR_OPS, node.attr, maxmatch=1, num_lines=n)
     return [(self._get_match_location(node, tr.symbol), tr)
-            for tr in self._get_traces(node.lineno, _ATTR_OPS, node.attr, 1)]
+            for tr in trs]
 
   def match_BinOp(self, node):
     if not isinstance(node.op, self._ast.Mod):
-      raise NotImplementedError("match_Binop:%s" % node.op.__class__.__name__)
+      raise NotImplementedError(f"match_Binop:{node.op.__class__.__name__}")
     op = "BINARY_MODULO"
     symbol = "__mod__"
     # The node's lineno is the first line of the operation, but the opcode's
@@ -264,10 +270,11 @@ class MatchAstVisitor(visitor.BaseVisitor):
         self.source.traces[line] for line in range(lineno, lineno + num_lines)):
       if maxmatch == 0:
         break
-      if (id(tr) not in self._matched and tr.op in ops and
-          symbol.match(tr.symbol)):
+      m_matched = self._matched
+      assert m_matched is not None
+      if (id(tr) not in m_matched and tr.op in ops and symbol.match(tr.symbol)):
         maxmatch -= 1
-        self._matched.add(id(tr))
+        m_matched.add(id(tr))
         yield tr
 
   def _get_match_location(self, node, name=None):
@@ -287,7 +294,7 @@ class MatchAstVisitor(visitor.BaseVisitor):
 
   def _get_node_name(self, node):
     if isinstance(node, self._ast.Attribute):
-      return "{}.{}".format(self._get_node_name(node.value), node.attr)
+      return f"{self._get_node_name(node.value)}.{node.attr}"
     elif isinstance(node, self._ast.Call):
       return self._get_node_name(node.func)
     elif isinstance(node, self._ast.Lambda):

@@ -414,7 +414,8 @@ class Converter(utils.ContextWeakrefMixin):
       assert name != v.name
       return pytd.Alias(name, pytd.NamedType(v.name))
     elif isinstance(v, abstract.InterpreterClass):
-      if (v.official_name is None or name == v.official_name) and not v.module:
+      if ((v.official_name is None or name == v.official_name or
+           v.official_name.endswith(f".{name}")) and not v.module):
         return self._class_to_def(node, v, name)
       else:
         # Represent a class alias as X: Type[Y] rather than X = Y so the pytd
@@ -583,7 +584,7 @@ class Converter(utils.ContextWeakrefMixin):
         template=())
     return pytd.Function(name, (pytd_sig,), pytd.MethodKind.METHOD)
 
-  def _function_to_return_types(self, node, fvar):
+  def _function_to_return_types(self, node, fvar, allowed_type_params=()):
     """Convert a function variable to a list of PyTD return types."""
     options = fvar.FilteredData(self.ctx.exitpoint, strict=False)
     if not all(isinstance(o, abstract.Function) for o in options):
@@ -599,11 +600,12 @@ class Converter(utils.ContextWeakrefMixin):
         types.extend(sig.pytd_sig.return_type for sig in val.signatures)
       else:
         types.append(pytd.AnythingType())
-    safe_types = []  # types without type parameters
+    safe_types = []  # types with illegal type parameters removed
     for t in types:
       params = pytd_utils.GetTypeParameters(t)
       t = t.Visit(visitors.ReplaceTypeParameters(
-          {p: p.upper_value for p in params}))
+          {p: p if p.name in allowed_type_params else p.upper_value
+           for p in params}))
       safe_types.append(t)
     return safe_types
 
@@ -672,24 +674,26 @@ class Converter(utils.ContextWeakrefMixin):
       decorators.append(pytd.Alias("final", fn))
 
     # Collect nested classes
-    classes = [self._class_to_def(node, x, x.name)
+    classes = [self.value_to_pytd_def(node, x, x.name)
                for x in v.get_inner_classes()]
     inner_class_names = {x.name for x in classes}
+
+    class_type_params = {t.name for t in v.template}
 
     # class-level attributes
     for name, member in v.members.items():
       if (name in abstract_utils.CLASS_LEVEL_IGNORE or
           name in annotated_names or
           (v.is_enum and name in ("__new__", "__eq__")) or
-          (self.ctx.options.enable_nested_classes and
-           name in inner_class_names)):
+          name in inner_class_names):
         continue
       for value in member.FilteredData(self.ctx.exitpoint, strict=False):
         if isinstance(value, special_builtins.PropertyInstance):
           # For simplicity, output properties as constants, since our parser
           # turns them into constants anyway.
           if value.fget:
-            for typ in self._function_to_return_types(node, value.fget):
+            for typ in self._function_to_return_types(
+                node, value.fget, allowed_type_params=class_type_params):
               constants[name].add_type(pytd.Annotated(typ, ("'property'",)))
           else:
             constants[name].add_type(
@@ -897,14 +901,13 @@ class Converter(utils.ContextWeakrefMixin):
         continue
       value = pytd.AnythingType() if name in fields_with_defaults else None
       final_constants.append(pytd.Constant(name, builder.build(), value))
-    classes = tuple(classes) if self.ctx.options.enable_nested_classes else ()
 
     cls = pytd.Class(name=class_name,
                      metaclass=metaclass,
                      bases=tuple(bases),
                      methods=tuple(methods.values()),
                      constants=tuple(final_constants),
-                     classes=classes,
+                     classes=tuple(classes),
                      decorators=tuple(decorators),
                      slots=slots,
                      template=())

@@ -1,7 +1,7 @@
 """Tests for the dataclasses overlay."""
 
-from pytype import file_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class TestDataclass(test_base.BaseTest):
@@ -756,7 +756,7 @@ class TestPyiDataclass(test_base.BaseTest):
   """Tests for @dataclasses in pyi files."""
 
   def test_basic(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -770,7 +770,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_type_mismatch(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -784,7 +784,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_subclass(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -811,7 +811,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_subclass_from_same_pyi(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -842,7 +842,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_subclass_from_different_pyi(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("bar.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -876,7 +876,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_default_params(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("bar.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -910,7 +910,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_subclass_classvar(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import ClassVar
         from dataclasses import dataclass
@@ -938,7 +938,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_properties_from_pyi(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from dataclasses import dataclass
         @dataclass
@@ -971,7 +971,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_recursion(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         import dataclasses
         from typing import Callable, Optional, List
@@ -1000,7 +1000,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_recursion_with_subclass(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         import dataclasses
         from typing import Callable, Optional, List
@@ -1029,7 +1029,7 @@ class TestPyiDataclass(test_base.BaseTest):
       """)
 
   def test_multi_step_recursion(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         import dataclasses
         @dataclasses.dataclass
@@ -1056,6 +1056,90 @@ class TestPyiDataclass(test_base.BaseTest):
           __dataclass_fields__: Dict[str, dataclasses.Field[Union[int, foo.B]]]
           def __init__(self, x: foo.B, w: int) -> None: ...
       """)
+
+  def test_parameterized_generic(self):
+    ty = self.Infer("""
+      from typing import Generic, TypeVar
+      import dataclasses
+      T = TypeVar('T')
+      @dataclasses.dataclass
+      class Foo(Generic[T]):
+        x: str
+        y: T
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import Dict, Generic, TypeVar, Union
+      import dataclasses
+      T = TypeVar('T')
+      @dataclasses.dataclass
+      class Foo(Generic[T]):
+        x: str
+        y: T
+        __dataclass_fields__: Dict[str, dataclasses.Field[Union[str, T]]]
+        def __init__(self, x: str, y: T) -> None:
+            self = Foo[T]
+    """)
+
+  def test_parameterized_subclass(self):
+    ty = self.Infer("""
+      from typing import Generic, TypeVar
+      import dataclasses
+      T = TypeVar('T')
+      @dataclasses.dataclass
+      class Foo(Generic[T]):
+        x: str
+        y: T
+      @dataclasses.dataclass
+      class Bar(Foo[int]):
+        z: float
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import Dict, Generic, TypeVar, Union
+      import dataclasses
+      T = TypeVar('T')
+      @dataclasses.dataclass
+      class Foo(Generic[T]):
+        x: str
+        y: T
+        __dataclass_fields__: Dict[str, dataclasses.Field[Union[str, T]]]
+        def __init__(self, x: str, y: T) -> None:
+            self = Foo[T]
+      @dataclasses.dataclass
+      class Bar(Foo[int]):
+        z: float
+        __dataclass_fields__: Dict[str, dataclasses.Field[Union[float, int, str]]]
+        def __init__(self, x: str, y: int, z: float) -> None: ...
+    """)
+
+  def test_parameterized_subclass_error_count(self):
+    self.CheckWithErrors("""
+      from typing import Generic, TypeVar
+      import dataclasses
+      T = TypeVar('T')
+      @dataclasses.dataclass
+      class Foo(Generic[T]):
+        x: str
+        y: T
+      @dataclasses.dataclass
+      class Bar(Foo[int]):
+        z: float
+      bar = Bar('test', 10, .4, .4)  # wrong-arg-count
+    """)
+
+  def test_parameterized_subclass_error_type(self):
+    self.CheckWithErrors("""
+      from typing import Generic, TypeVar
+      import dataclasses
+      T = TypeVar('T')
+      @dataclasses.dataclass
+      class Foo(Generic[T]):
+        x: str
+        y: T
+      @dataclasses.dataclass
+      class Bar(Foo[int]):
+        z: float
+      bar = Bar('test', .4, .4)  # wrong-arg-types
+    """)
 
 if __name__ == "__main__":
   test_base.main()

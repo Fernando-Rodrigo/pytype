@@ -4,6 +4,7 @@ import logging
 import os
 import re
 
+from pytype.platform_utils import path_utils
 from pytype.tools.merge_pyi import merge_pyi
 import unittest
 
@@ -16,7 +17,7 @@ OVERWRITE_EXPECTED = 0  # flip to regenerate expected files
 
 
 def load_tests(unused_loader, standard_tests, unused_pattern):
-  root = os.path.join(os.path.dirname(__file__), 'test_data')
+  root = path_utils.join(path_utils.dirname(__file__), 'test_data')
   standard_tests.addTests(TestBuilder().build(root))
   return standard_tests
 
@@ -37,8 +38,8 @@ class TestBuilder:
       if not OVERWRITE_EXPECTED and EXPECTED not in files_by_ext:
         continue
 
-      py, pyi = [files_by_ext[x] for x in (PY, PYI)]
-      outfile = os.path.join(data_dir, base + '.' + EXPECTED)
+      py, pyi = (files_by_ext[x] for x in (PY, PYI))
+      outfile = path_utils.join(data_dir, base + '.' + EXPECTED)
 
       test = build_regression_test(py, pyi, outfile)
       suite.addTest(test)
@@ -53,7 +54,7 @@ class TestBuilder:
     ret = collections.defaultdict(dict)
     for m in matches:
       base, ext, filename = m.group('base'), m.group('ext'), m.group('filename')
-      ret[base][ext] = os.path.join(data_dir, filename)
+      ret[base][ext] = path_utils.join(data_dir, filename)
 
     return ret
 
@@ -61,7 +62,7 @@ class TestBuilder:
 def build_regression_test(py, pyi, outfile):
 
   def regression_test(test_case):
-    py_input, pyi_src = [_read_file(f) for f in (py, pyi)]
+    py_input, pyi_src = (_read_file(f) for f in (py, pyi))
     output = merge_pyi.merge_sources(py=py_input, pyi=pyi_src)
 
     if OVERWRITE_EXPECTED:
@@ -71,8 +72,8 @@ def build_regression_test(py, pyi, outfile):
       expected = _read_file(outfile)
       test_case.assertEqual(expected, output, _get_diff(expected, output))
 
-  name = os.path.splitext(os.path.basename(outfile))[0].replace('.', '_')
-  test = 'test_%s' % name
+  name = path_utils.splitext(path_utils.basename(outfile))[0].replace('.', '_')
+  test = f'test_{name}'
   case = type('RegressionTest', (unittest.TestCase,), {test: regression_test})
   return case(test)
 

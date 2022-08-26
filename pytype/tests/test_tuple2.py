@@ -1,8 +1,8 @@
 """Tests of builtins.tuple."""
 
-from pytype import file_utils
 from pytype.pytd import pytd_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class TupleTest(test_base.BaseTest):
@@ -74,13 +74,13 @@ class TupleTest(test_base.BaseTest):
     tuple_ints = r"Tuple\[int, \.\.\.\]"
     tuple_str_str = r"Tuple\[str, str\]"
     self.assertErrorRegexes(errors, {
-        "e1": r"%s.*%s" % (x, tuple_int),
-        "e2": r"%s.*%s" % (x, tuple_ints),
-        "e3": r"%s.*%s" % (y, tuple_int),
-        "e4": r"%s.*%s" % (y, tuple_str_str)})
+        "e1": fr"{x}.*{tuple_int}",
+        "e2": fr"{x}.*{tuple_ints}",
+        "e3": fr"{y}.*{tuple_int}",
+        "e4": fr"{y}.*{tuple_str_str}"})
 
   def test_inline_tuple(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Tuple
         class A(Tuple[int, str]): ...
@@ -98,7 +98,7 @@ class TupleTest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_inline_tuple_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Tuple
         class A(Tuple[str, int]): ...
@@ -117,8 +117,8 @@ class TupleTest(test_base.BaseTest):
       expected = r"Tuple\[int, str\]"
       actual = r"Tuple\[str, int\]"
       self.assertErrorRegexes(errors, {
-          "e1": r"Type\[%s\].*Type\[%s\]" % (expected, actual),
-          "e2": r"%s.*%s" % (expected, actual),
+          "e1": fr"Type\[{expected}\].*Type\[{actual}\]",
+          "e2": fr"{expected}.*{actual}",
           "e3": r"%s.*foo\.A" % expected})
 
   def test_tuple_combination_explosion(self):
@@ -142,7 +142,7 @@ class TupleTest(test_base.BaseTest):
     """)
 
   def test_mismatched_pyi_tuple(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("bar.pyi", """
         class Bar(tuple): ...
       """)
@@ -174,7 +174,7 @@ class TupleTest(test_base.BaseTest):
       def f(x: Tuple[()]):
         pass
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo))
       self.CheckWithErrors("""
         from typing import Any
@@ -183,7 +183,7 @@ class TupleTest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_match_nothing(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Tuple
         def integrate() -> Tuple[nothing, nothing]: ...
@@ -226,7 +226,7 @@ class TupleTestPython3Feature(test_base.BaseTest):
     _, errors = self.InferWithErrors("""
       a, *b, c = (1,)  # bad-unpacking[e]
     """)
-    self.assertErrorRegexes(errors, {"e": r"1 value.*3 variables"})
+    self.assertErrorRegexes(errors, {"e": r"1 value.*2 variables"})
 
   def test_strptime(self):
     ty = self.Infer("""

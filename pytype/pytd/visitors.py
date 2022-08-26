@@ -4,7 +4,7 @@ import collections
 import itertools
 import logging
 import re
-from typing import Set, cast
+from typing import List, Set, cast
 
 from pytype import datatypes
 from pytype import module_utils
@@ -105,13 +105,21 @@ class FillInLocalPointers(Visitor):
       attribute. Call VerifyLookup() on your tree if you want to be sure that
       all of the cls pointers have been filled in.
     """
-    for prefix, cls in self._Lookup(node):
-      if isinstance(cls, pytd.Class):
-        node.cls = cls
-        return
-      else:
-        logging.warning("Couldn't resolve %s: Not a class: %s",
-                        prefix + node.name, type(cls))
+    nodes = [node]
+    while nodes:
+      cur_node = nodes.pop(0)
+      for prefix, cls in self._Lookup(cur_node):
+        if isinstance(cls, pytd.Alias) and isinstance(cls.type, pytd.ClassType):
+          if cls.type.cls:
+            cls = cls.type.cls
+          else:
+            nodes.append(cls.type)
+        if isinstance(cls, pytd.Class):
+          node.cls = cls
+          return
+        else:
+          logging.warning("Couldn't resolve %s: Not a class: %s",
+                          prefix + node.name, type(cls))
 
 
 class _RemoveTypeParametersFromGenericAny(Visitor):
@@ -225,14 +233,14 @@ class VerifyLookup(Visitor):
 
   def EnterLateType(self, node):
     if not self.ignore_late_types:
-      raise ValueError("Unresolved LateType: %r" % node.name)
+      raise ValueError(f"Unresolved LateType: {node.name!r}")
 
   def EnterNamedType(self, node):
-    raise ValueError("Unreplaced NamedType: %r" % node.name)
+    raise ValueError(f"Unreplaced NamedType: {node.name!r}")
 
   def EnterClassType(self, node):
     if node.cls is None:
-      raise ValueError("Unresolved class: %r" % node.name)
+      raise ValueError(f"Unresolved class: {node.name!r}")
 
 
 class _ToTypeVisitor(Visitor):
@@ -250,6 +258,7 @@ class _ToTypeVisitor(Visitor):
     self._in_alias = False
     self._in_literal = 0
     self.allow_singletons = allow_singletons
+    self.allow_functions = False
 
   def EnterAlias(self, _):
     assert not self._in_alias
@@ -267,7 +276,7 @@ class _ToTypeVisitor(Visitor):
 
   def to_type(self, t):
     allow_constants = self._in_alias or self._in_literal
-    allow_functions = self._in_alias
+    allow_functions = self._in_alias or self.allow_functions
     return pytd.ToType(
         t, allow_constants=allow_constants, allow_functions=allow_functions,
         allow_singletons=self.allow_singletons)
@@ -328,6 +337,18 @@ def MaybeSubstituteParameters(base_type, parameters=None):
   return base_type.Visit(ReplaceTypeParameters(mapping))
 
 
+def _MaybeSubstituteParametersInGenericType(node):
+  if isinstance(node.base_type, (pytd.GenericType, pytd.UnionType)):
+    try:
+      node = MaybeSubstituteParameters(
+          node.base_type, node.parameters) or node
+    except ValueError as e:
+      raise KeyError(str(e)) from e
+  elif isinstance(node.base_type, pytd.AnythingType):
+    return node.base_type
+  return node
+
+
 class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
   """Look up NamedType pointers using a symbol table."""
 
@@ -349,7 +370,7 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
     self._alias_name = None
     self._in_generic_type = 0
     self._star_imports = set()
-    self._unit = None
+    self._unit = module_map.get(self_name)
 
   def _ResolveUsingGetattr(self, module_name, module):
     """Try to resolve an identifier using the top level __getattr__ function."""
@@ -403,7 +424,7 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
     if module_name in self._module_map:
       return self._module_map[module_name], cls_prefix
     else:
-      raise KeyError("Unknown module %s" % name)
+      raise KeyError(f"Unknown module {name}")
 
   def VisitNamedType(self, t):
     """Try to look up a NamedType.
@@ -457,7 +478,7 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
         # we need to manually resolve it here.
         item = self._ResolveUsingStarImport(module, name)
         if item is None:
-          raise KeyError("No %s in module %s" % (name, module_name)) from e
+          raise KeyError(f"No {name} in module {module_name}") from e
     if not self._in_generic_type and isinstance(item, pytd.Alias):
       # If `item` contains type parameters and is not inside a GenericType, then
       # we replace the parameters with Any.
@@ -481,13 +502,7 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
       return new_type
 
   def VisitGenericType(self, node):
-    if isinstance(node.base_type, (pytd.GenericType, pytd.UnionType)):
-      try:
-        node = MaybeSubstituteParameters(
-            node.base_type, node.parameters) or node
-      except ValueError as e:
-        raise KeyError(str(e)) from e
-    return node
+    return _MaybeSubstituteParametersInGenericType(node)
 
   def _ModulePrefix(self):
     return self.name + "." if self.name else ""
@@ -507,10 +522,21 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
     getattrs = set()
     ast = self._module_map[module]
     type_param_names = set()
+    if module == "http.client":
+      # NOTE: http.client adds symbols to globals() at runtime, which is not
+      # reflected in its typeshed pyi file. The simplest fix is to ignore
+      # __all__ for star-imports of that file.
+      exports = None
+    else:
+      exports = [x for x in ast.constants if x.name.endswith(".__all__")]
+      if exports:
+        exports = exports[0].value
     for member in sum((ast.constants, ast.type_params, ast.classes,
                        ast.functions, ast.aliases), ()):
       _, _, member_name = member.name.rpartition(".")
-      if member_name == "__all__":
+      if exports and member_name not in exports:
+        # Not considering the edge case `__all__ = []` since that makes no
+        # sense in practice.
         continue
       new_name = self._ModulePrefix() + member_name
       if isinstance(member, pytd.Function) and member_name == "__getattr__":
@@ -538,6 +564,31 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
         new_members.append(m)
     return new_members
 
+  def _ResolveAlias(self, alias):
+    if not isinstance(alias.type, pytd.NamedType):
+      return alias.type
+    try:
+      module, _ = self._LookupModuleRecursive(alias.type.name)
+    except KeyError:
+      return alias.type
+    try:
+      value = module.Lookup(alias.type.name)
+    except KeyError:
+      return alias.type
+    if isinstance(value, pytd.Alias):
+      return self._ResolveAlias(value)
+    else:
+      return value
+
+  def _EquivalentAliases(self, alias1, alias2) -> bool:
+    if alias1 == alias2:
+      return True
+    if (isinstance(alias1.type, pytd.Module) and
+        isinstance(alias2.type, pytd.Module) and
+        alias1.type.module_name == alias2.type.module_name):
+      return True
+    return self._ResolveAlias(alias1) == self._ResolveAlias(alias2)
+
   def _HandleDuplicates(self, new_aliases):
     """Handle duplicate module-level aliases.
 
@@ -554,13 +605,6 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
     Raises:
       KeyError: If there is a name clash.
     """
-    def SameModuleName(a, b):
-      return (
-          isinstance(a.type, pytd.Module) and
-          isinstance(b.type, pytd.Module) and
-          a.type.module_name == b.type.module_name
-      )
-
     name_to_alias = {}
     out = []
     for a in new_aliases:
@@ -569,10 +613,12 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
         out.append(a)
         continue
       existing = name_to_alias[a.name]
-      if existing == a or SameModuleName(existing, a):
+      if self._EquivalentAliases(existing, a):
         continue
-      raise KeyError("Duplicate top level items: %r, %r" % (
-          existing.type.name, a.type.name))
+      existing_name = existing.type.name or existing.type.__class__.__name__
+      a_name = a.type.name or a.type.__class__.__name__
+      raise KeyError("Duplicate top level items: {!r}, {!r}".format(
+          existing_name, a_name))
     return out
 
   def EnterTypeDeclUnit(self, node):
@@ -623,13 +669,11 @@ class LookupExternalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
 class LookupLocalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
   """Look up local identifiers. Must be called on a TypeDeclUnit."""
 
-  def __init__(self, allow_singletons=False, toplevel=True,
-               enable_nested_classes=True):
+  def __init__(self, allow_singletons=False, toplevel=True):
     super().__init__(allow_singletons)
     self._toplevel = toplevel
     self.local_names = set()
     self.class_names = []
-    self._enable_nested_classes = enable_nested_classes
 
   def EnterTypeDeclUnit(self, unit):
     self.unit = unit
@@ -738,7 +782,7 @@ class LookupLocalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
       try:
         resolved_node = self.to_type(item)
       except NotImplementedError as e:
-        raise SymbolLookupError("%s is not a type" % item) from e
+        raise SymbolLookupError(f"{item} is not a type") from e
     if isinstance(resolved_node, (pytd.Constant, pytd.Function)):
       visitor = LookupLocalTypes()
       visitor.unit = self.unit
@@ -746,7 +790,7 @@ class LookupLocalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
     return resolved_node
 
   def VisitClassType(self, t):
-    if not t.cls and self._enable_nested_classes:
+    if not t.cls:
       if t.name == self.class_names[-1]:
         full_name = ".".join(self.class_names)
         lookup_type = pytd.NamedType(full_name)
@@ -757,6 +801,9 @@ class LookupLocalTypes(_RemoveTypeParametersFromGenericAny, _ToTypeVisitor):
       if lookup_type:
         t.cls = cast(pytd.ClassType, self.VisitNamedType(lookup_type)).cls
     return t
+
+  def VisitGenericType(self, node):
+    return _MaybeSubstituteParametersInGenericType(node)
 
 
 class ReplaceTypes(Visitor):
@@ -1019,7 +1066,7 @@ class CreateTypeParametersForSignatures(Visitor):
       safe_class_name = pytd_utils.Print(pytd.NamedType(self.class_name))
       return (pytd_utils.Print(sig.return_type) == safe_class_name and
               pytd_utils.Print(sig.params[0].type) in (
-                  "Type[%s]" % safe_class_name, safe_class_name))
+                  f"Type[{safe_class_name}]", safe_class_name))
     return False
 
   def VisitSignature(self, sig):
@@ -1079,8 +1126,8 @@ class VerifyVisitor(Visitor):
       for a1, a2 in itertools.combinations(attrs, 2):
         both = attr_to_set[a1] & attr_to_set[a2]
         if both:
-          raise AssertionError("Duplicate name(s) %s in both %s and %s" % (
-              list(both), a1, a2))
+          raise AssertionError(f"Duplicate name(s) {list(both)} in both {a1} "
+                               f"and {a2}")
 
   def EnterTypeDeclUnit(self, node):
     self._AssertNoDuplicates(node, ["constants", "type_params", "classes",
@@ -1189,6 +1236,10 @@ class AddNamePrefix(Visitor):
       # This is an external type; do not prefix it. StripExternalNamePrefix will
       # remove it later.
       return node
+    if node.name.split(".")[0] in self.classes:
+      # We need to check just the first part, in case we have a class constant
+      # like Foo.BAR, or some similarly nested name.
+      return node.Replace(name=self.prefix + node.name)
     if self.cls_stack:
       if node.name == self.cls_stack[-1].name:
         # We're referencing a class from within itself.
@@ -1200,10 +1251,6 @@ class AddNamePrefix(Visitor):
           # ImmediateOuter.Nested, so we need to insert the full class stack.
           name = self.prefix + self._ClassStackString() + "." + base
           return node.Replace(name=name)
-    if node.name.split(".")[0] in self.classes:
-      # We need to check just the first part, in case we have a class constant
-      # like Foo.BAR, or some similarly nested name.
-      return node.Replace(name=self.prefix + node.name)
     return node
 
   def VisitClass(self, node):
@@ -1412,9 +1459,8 @@ class AdjustTypeParameters(Visitor):
           # to be replaced by typing.Generic by the time this visitor is called?
           self._CheckDuplicateNames(params, node.name)
           if generic_template:
-            raise ContainerError(
-                "Cannot inherit from Generic[...] multiple times in class %s"
-                % node.name)
+            raise ContainerError("Cannot inherit from Generic[...] "
+                                 f"multiple times in class {node.name}")
           else:
             generic_template = params
         else:
@@ -1432,7 +1478,7 @@ class AdjustTypeParameters(Visitor):
       template = mro.MergeSequences(templates)
     except ValueError as e:
       raise ContainerError(
-          "Illegal type parameter order in class %s" % node.name) from e
+          f"Illegal type parameter order in class {node.name}") from e
 
     self.class_template.append(template)
 
@@ -1551,7 +1597,7 @@ class AdjustTypeParameters(Visitor):
   def VisitTypeParameter(self, node):
     """Add scopes to type parameters, track unbound params."""
     if self.constant_name and not self._IsBoundTypeParam(node):
-      raise ContainerError("Unbound type parameter %s in %s" % (
+      raise ContainerError("Unbound type parameter {} in {}".format(
           node.name, self._GetFullName(self.constant_name)))
     scope = self._GetScope(node.name)
     if scope:
@@ -1587,17 +1633,17 @@ class VerifyContainers(Visitor):
     if isinstance(base_type, pytd.LateType):
       return  # We can't verify this yet
     if not pytd.IsContainer(base_type.cls):
-      raise ContainerError("Class %s is not a container" % base_type.name)
+      raise ContainerError(f"Class {base_type.name} is not a container")
     elif base_type.name in ("typing.Generic", "typing.Protocol"):
       for t in node.parameters:
         if not isinstance(t, pytd.TypeParameter):
-          raise ContainerError("Name %s must be defined as a TypeVar" % t.name)
+          raise ContainerError(f"Name {t.name} must be defined as a TypeVar")
     elif not isinstance(node, (pytd.CallableType, pytd.TupleType)):
       actual_param_count = len(node.parameters)
       max_param_count = len(base_type.cls.template)
       if actual_param_count > max_param_count:
         raise ContainerError(
-            "Too many parameters on %s: expected %s, got %s" % (
+            "Too many parameters on {}: expected {}, got {}".format(
                 base_type.name, max_param_count, actual_param_count))
 
   def EnterCallableType(self, node):
@@ -1714,14 +1760,13 @@ class VerifyContainers(Visitor):
         continue
       elif len(values) > 1 and not self._TypeCompatibilityCheck(values):
         raise ContainerError(
-            "Conflicting values for TypeVar %s: %s" % (
+            "Conflicting values for TypeVar {}: {}".format(
                 param_name, ", ".join(str(v) for v in values)))
     for t in node.template:
       if t.type_param.full_name in param_to_values:
         value, = param_to_values[t.type_param.full_name]
         raise ContainerError(
-            "Conflicting value %s for TypeVar %s" % (value,
-                                                     t.type_param.full_name))
+            f"Conflicting value {value} for TypeVar {t.type_param.full_name}")
 
 
 class VerifyLiterals(Visitor):
@@ -1819,7 +1864,7 @@ class ExpandCompatibleBuiltins(Visitor):
     # type and compat is the less generalized one. (eg: name = float, compat =
     # int)
     compat_list = itertools.chain(
-        set((v, v) for _, v in pep484.COMPAT_ITEMS), pep484.COMPAT_ITEMS)
+        {(v, v) for _, v in pep484.COMPAT_ITEMS}, pep484.COMPAT_ITEMS)
 
     for compat, name in compat_list:
       prefix = builtins.name + "."
@@ -1848,14 +1893,6 @@ class ExpandCompatibleBuiltins(Visitor):
     assert self.in_type_parameter
     self.in_type_parameter = False
 
-  def EnterLiteral(self, _):
-    assert not self.in_type_parameter
-    self.in_type_parameter = True
-
-  def LeaveLiteral(self, _):
-    assert self.in_type_parameter
-    self.in_type_parameter = False
-
   def VisitClassType(self, node):
     if self.in_parameter and not self.in_type_parameter:
       return self.replacements.get(node.name, node)
@@ -1873,9 +1910,8 @@ class ClearClassPointers(Visitor):
 class ReplaceModulesWithAny(_RemoveTypeParametersFromGenericAny):
   """Replace all references to modules in a list with AnythingType."""
 
-  def __init__(self, module_list):
+  def __init__(self, module_list: List[str]):
     super().__init__()
-    assert isinstance(module_list, list)
     self._any_modules = module_list
 
   def VisitNamedType(self, n):

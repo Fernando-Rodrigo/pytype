@@ -1,10 +1,10 @@
 """Utilities used in vm.py."""
 
 import abc
-import collections
+import collections.abc
+import dataclasses
 import itertools
 import logging
-import os
 import re
 import reprlib
 from typing import Optional, Sequence, Union
@@ -18,6 +18,7 @@ from pytype.abstract import abstract
 from pytype.abstract import abstract_utils
 from pytype.abstract import function
 from pytype.abstract import mixin
+from pytype.platform_utils import path_utils
 from pytype.pyc import opcodes
 from pytype.pytd import mro
 from pytype.pytd import pytd
@@ -36,7 +37,11 @@ repper = _repr_obj.repr
 
 _FUNCTION_TYPE_COMMENT_RE = re.compile(r"^\((.*)\)\s*->\s*(\S.*?)\s*$")
 
-_Block = collections.namedtuple("Block", ["type", "level"])
+
+@dataclasses.dataclass(eq=True, frozen=True)
+class _Block:
+  type: str
+  level: int
 
 
 class FindIgnoredTypeComments:
@@ -110,6 +115,7 @@ class _NameErrorDetails(abc.ABC):
 class _NameInInnerClassErrorDetails(_NameErrorDetails):
 
   def __init__(self, attr, class_name):
+    super().__init__()
     self._attr = attr
     self._class_name = class_name
 
@@ -122,6 +128,7 @@ class _NameInOuterClassErrorDetails(_NameErrorDetails):
   """Name error details for a name defined in an outer class."""
 
   def __init__(self, attr, prefix, class_name):
+    super().__init__()
     self._attr = attr
     self._prefix = prefix
     self._class_name = class_name
@@ -137,8 +144,10 @@ class _NameInOuterClassErrorDetails(_NameErrorDetails):
 
 
 class _NameInOuterFunctionErrorDetails(_NameErrorDetails):
+  """Name error details for a name defined in an outer function."""
 
   def __init__(self, attr, outer_scope, inner_scope):
+    super().__init__()
     self._attr = attr
     self._outer_scope = outer_scope
     self._inner_scope = inner_scope
@@ -309,8 +318,9 @@ def get_name_error_details(
 
 def _module_name(frame):
   if frame.f_code.co_filename:
-    return ".".join(re.sub(
-        r"\.py$", "", frame.f_code.co_filename).split(os.sep)[-2:])
+    return ".".join(
+        re.sub(r"\.py$", "",
+               frame.f_code.co_filename).split(path_utils.sep)[-2:])
   else:
     return ""
 
@@ -412,8 +422,8 @@ def _expand_generic_protocols(node, bases, ctx):
                                           ctx, b.data.template), {b}, node)
         else:
           protocol_base.PasteBinding(b)
-      expanded_bases.append(protocol_base)
       expanded_bases.append(generic_base)
+      expanded_bases.append(protocol_base)
     else:
       expanded_bases.append(base)
   return expanded_bases
@@ -543,7 +553,7 @@ def _check_defaults(node, method, ctx):
                          e.__class__.__name__) from e
   for e, arg_name, value in errors:
     bad_param = e.bad_call.bad_param
-    expected_type = bad_param.expected
+    expected_type = bad_param.typ
     if value == ctx.convert.ellipsis:
       # `...` should be a valid default parameter value for overloads.
       # Unfortunately, the is_overload attribute is not yet set when
@@ -652,7 +662,8 @@ def _overrides(subcls, supercls, attr):
         break
       if isinstance(cls, mixin.LazyMembers):
         cls.load_lazy_attribute(attr)
-      if attr in cls.members and cls.members[attr].bindings:
+      if (isinstance(cls, abstract.SimpleValue) and attr in cls.members and
+          cls.members[attr].bindings):
         return True
   return False
 
@@ -705,6 +716,37 @@ def _call_binop_on_bindings(node, name, xval, yval, ctx):
     return node, None
 
 
+def _get_annotation(node, var, ctx):
+  """Extract an annotation from terms in `a | b | ...`."""
+  # Python does not support late annotations in | expressions
+  try:
+    abstract_utils.get_atomic_python_constant(var, str)
+  except abstract_utils.ConversionError:
+    pass
+  else:
+    return None
+  with ctx.errorlog.checkpoint() as record:
+    annot = ctx.annotation_utils.extract_annotation(
+        node, var, "varname", ctx.vm.simple_stack())
+    if record.errors:
+      return None
+    return annot
+
+
+def _maybe_union(node, x, y, ctx):
+  """Attempt to evaluate a '|' operation as a typing.Union."""
+  x_annot = _get_annotation(node, x, ctx)
+  y_annot = _get_annotation(node, y, ctx)
+  opts = [x_annot, y_annot]
+  if any(o is None for o in opts):
+    return None
+  if all(isinstance(o, abstract.AMBIGUOUS) for o in opts):
+    # It is ambiguous whether this is a typing.Union or a regular __or__
+    # operation. Returning unsolvable is safe either way.
+    return ctx.new_unsolvable(node)
+  return abstract.Union(opts, ctx).to_variable(node)
+
+
 def call_binary_operator(state, name, x, y, report_errors, ctx):
   """Map a binary operator to "magic methods" (__add__ etc.)."""
   results = []
@@ -722,6 +764,15 @@ def call_binary_operator(state, name, x, y, report_errors, ctx):
         if ret:
           nodes.append(node)
           results.append(ret)
+  # Python 3.10 supports writing union types as A | B | ...
+  # Only try this as a fallback otherwise we miss overriding of __or__
+  if ctx.python_version >= (3, 10) and name == "__or__":
+    fail = (error or not results
+            or isinstance(results[0].data[0], abstract.Unsolvable))
+    if fail:
+      ret = _maybe_union(state.node, x, y, ctx)
+      if ret:
+        return state, ret
   if nodes:
     state = state.change_cfg_node(ctx.join_cfg_nodes(nodes))
   result = ctx.join_variables(state.node, results)
@@ -735,8 +786,6 @@ def call_binary_operator(state, name, x, y, report_errors, ctx):
         if ctx.options.report_errors:
           ctx.errorlog.unsupported_operands(ctx.vm.frames, name, x, y)
         result = ctx.new_unsolvable(state.node)
-    elif isinstance(error, function.DictKeyMissing):
-      state, result = error.get_return(state)
     else:
       if ctx.options.report_errors:
         ctx.errorlog.invalid_function_call(ctx.vm.frames, error)
@@ -804,6 +853,7 @@ def load_closure_cell(state, op, check_bindings, ctx):
   # See test_closures.ClosuresTest.test_undefined_var
   if check_bindings and not cell.bindings:
     ctx.errorlog.name_error(ctx.vm.frames, op.pretty_arg)
+    cell = ctx.new_unsolvable(state.node)
   visible_bindings = cell.Filter(state.node, strict=False)
   if len(visible_bindings) != len(cell.bindings):
     # We need to filter here because the closure will be analyzed outside of
@@ -1103,3 +1153,17 @@ def to_coroutine(state, obj, top, ctx):
   for b in obj.bindings:
     state = _binding_to_coroutine(state, b, bad_bindings, ret, top, ctx)
   return state, ret
+
+
+def adjust_block_returns(code, block_returns):
+  """Adjust line numbers for return statements in with blocks."""
+
+  rets = {k: iter(v) for k, v in block_returns}
+  for block in code.order:
+    for op in block:
+      if op.__class__.__name__ == "RETURN_VALUE":
+        if op.line in rets:
+          lines = rets[op.line]
+          new_line = next(lines, None)
+          if new_line:
+            op.line = new_line

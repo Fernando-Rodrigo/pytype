@@ -13,18 +13,18 @@ STEP = collections.namedtuple("STEP", ["name", "command"])
 
 def _begin_step(s):
   print("")
-  print("BEGIN_STEP: %s" % s.name)
-  print("STEP_COMMAND: %s" % ' '.join(s.command))
+  print(f"BEGIN_STEP: {s.name}")
+  print(f"STEP_COMMAND: {' '.join(s.command)}")
   print("")
 
 
 def _end_step(s):
-  print("\nEND_STEP: %s\n" % s.name)
+  print(f"\nEND_STEP: {s.name}\n")
 
 
 def _report_failure(s):
   print("")
-  print(">>> STEP_FAILED: %s" % s.name)
+  print(f">>> STEP_FAILED: {s.name}")
   print("")
 
 
@@ -51,7 +51,8 @@ def main():
             command=["python", "-m",
                      "pytype_extensions.test_pytype_extensions"])
   s5 = STEP(name="Type Check",
-            command=[os.path.join("out", "bin", "pytype"), "-j", "auto"])
+            command=(['python'] if sys.platform == 'win32' else []) +
+               [os.path.join("out", "bin", "pytype"), "-j", "auto"])
   _run_steps([s1, s2, s3, s4, s5])
   print("\n*** All build steps completed successfully! ***\n")
 

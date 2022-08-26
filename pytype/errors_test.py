@@ -3,13 +3,12 @@
 import collections
 import csv
 import io
-import os
 import textwrap
 from unittest import mock
 
 from pytype import errors
-from pytype import file_utils
 from pytype import state as frame_state
+from pytype.platform_utils import path_utils
 from pytype.tests import test_utils
 
 import unittest
@@ -116,10 +115,11 @@ class ErrorTest(unittest.TestCase):
     message, details = "This is an error", "with\nsome\ndetails: \"1\", 2, 3"
     errorlog.error(op.to_stack(), message, details + "0")
     errorlog.error(op.to_stack(), message, details + "1")
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       filename = d.create_file("errors.csv")
-      errorlog.print_to_csv_file(filename)
-      with open(filename, "r") as fi:
+      with open(filename, "w") as fi:
+        errorlog.print_to_csv_file(fi)
+      with open(filename) as fi:
         rows = list(csv.reader(fi, delimiter=","))
         self.assertEqual(len(rows), 2)
         for i, row in enumerate(rows):
@@ -135,10 +135,11 @@ class ErrorTest(unittest.TestCase):
     errorlog = errors.ErrorLog()
     stack = test_utils.fake_stack(2)
     errorlog.error(stack, "", "some\ndetails")
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       filename = d.create_file("errors.csv")
-      errorlog.print_to_csv_file(filename)
-      with open(filename, "r") as fi:
+      with open(filename, "w") as fi:
+        errorlog.print_to_csv_file(fi)
+      with open(filename) as fi:
         (_, _, _, _, actual_details), = list(csv.reader(fi, delimiter=","))
         self.assertMultiLineEqual(actual_details, textwrap.dedent("""
           some
@@ -163,7 +164,7 @@ class ErrorLogBaseTest(unittest.TestCase):
   def test_error(self):
     errorlog = errors.ErrorLog()
     op = test_utils.FakeOpcode("foo.py", 123, "foo")
-    errorlog.error(op.to_stack(), "unknown attribute %s" % "xyz")
+    errorlog.error(op.to_stack(), f"unknown attribute {'xyz'}")
     self.assertEqual(len(errorlog), 1)
     e = list(errorlog)[0]  # iterate the log and save the first error.
     self.assertEqual(errors.SEVERITY_ERROR, e._severity)
@@ -266,7 +267,7 @@ class ErrorLogBaseTest(unittest.TestCase):
   def test_color_print_to_stderr(self):
     errorlog = errors.ErrorLog()
     op = test_utils.FakeOpcode("foo.py", 123, "foo")
-    errorlog.error(op.to_stack(), "unknown attribute %s" % "xyz")
+    errorlog.error(op.to_stack(), f"unknown attribute {'xyz'}")
     self.assertEqual(len(errorlog), 1)
 
     mock_stderr = io.StringIO()
@@ -279,7 +280,7 @@ class ErrorLogBaseTest(unittest.TestCase):
   def test_color_print_to_file(self):
     errorlog = errors.ErrorLog()
     op = test_utils.FakeOpcode("foo.py", 123, "foo")
-    errorlog.error(op.to_stack(), "unknown attribute %s" % "xyz")
+    errorlog.error(op.to_stack(), f"unknown attribute {'xyz'}")
     self.assertEqual(len(errorlog), 1)
 
     string_io = io.StringIO()
@@ -290,11 +291,11 @@ class ErrorLogBaseTest(unittest.TestCase):
 
 
 class ErrorDocTest(unittest.TestCase):
-  ERROR_FILE_PATH = os.path.join(os.path.dirname(errors.__file__),
-                                 "../docs/errors.md")
+  ERROR_FILE_PATH = path_utils.join(
+      path_utils.dirname(errors.__file__), "../docs/errors.md")
 
   def _check_and_get_documented_errors(self):
-    with open(self.ERROR_FILE_PATH, "r") as f:
+    with open(self.ERROR_FILE_PATH) as f:
       lines = f.readlines()
     entries = [line[3:].strip() for line in lines if line.startswith("##")]
     counts = collections.Counter(entries)

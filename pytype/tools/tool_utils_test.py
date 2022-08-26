@@ -1,9 +1,11 @@
 """Tests for tool_utils.py."""
 
-import os
+import sys
 
-from pytype import file_utils
+from pytype.platform_utils import path_utils
+from pytype.tests import test_utils
 from pytype.tools import tool_utils
+
 import unittest
 
 
@@ -30,14 +32,17 @@ class TestMakeDirsOrDie(unittest.TestCase):
   """Tests for tool_utils.makedirs_or_die()."""
 
   def test_make(self):
-    with file_utils.Tempdir() as d:
-      subdir = os.path.join(d.path, 'some/path')
+    with test_utils.Tempdir() as d:
+      subdir = path_utils.join(d.path, 'some/path')
       tool_utils.makedirs_or_die(subdir, '')
-      self.assertTrue(os.path.isdir(subdir))
+      self.assertTrue(path_utils.isdir(subdir))
 
   def test_die(self):
     with self.assertRaises(SystemExit):
-      tool_utils.makedirs_or_die('/nonexistent/path', '')
+      if sys.platform == 'win32':
+        tool_utils.makedirs_or_die('C:/invalid:path', '')
+      else:
+        tool_utils.makedirs_or_die('/nonexistent/path', '')
 
 
 if __name__ == '__main__':

@@ -12,13 +12,14 @@ from pytype import __version__
 from pytype import analyze
 from pytype import config
 from pytype import constant_folding
-from pytype import directors
 from pytype import errors
 from pytype import load_pytd
 from pytype import utils
+from pytype.directors import directors
+from pytype.imports import builtin_stubs as pytd_builtins
+from pytype.imports import pickle_utils
 from pytype.pyc import pyc
 from pytype.pyi import parser
-from pytype.pytd import builtin_stubs as pytd_builtins
 from pytype.pytd import optimize
 from pytype.pytd import pytd_utils
 from pytype.pytd import serialize_ast
@@ -36,9 +37,8 @@ def read_source_file(input_filename, open_function=open):
   try:
     with open_function(input_filename, "r", encoding="utf8") as fi:
       return fi.read()
-  except IOError as e:
-    raise utils.UsageError("Could not load input file %s" %
-                           input_filename) from e
+  except OSError as e:
+    raise utils.UsageError(f"Could not load input file {input_filename}") from e
 
 
 def _set_verbosity_from(posarg):
@@ -154,7 +154,11 @@ def check_or_generate_pyi(options, loader=None):
   except IndentationError as e:
     errorlog.python_compiler_error(options.input, e.lineno, e.msg)
   except libcst.ParserSyntaxError as e:
+    # TODO(rechen): We can get rid of this branch once we delete
+    # directors.parser_libcst.
     errorlog.python_compiler_error(options.input, e.raw_line, e.message)
+  except SyntaxError as e:
+    errorlog.python_compiler_error(options.input, e.lineno, e.msg)
   except directors.SkipFileError:
     result += "# skip-file found, file not analyzed"
   except Exception as e:  # pylint: disable=broad-except
@@ -166,7 +170,7 @@ def check_or_generate_pyi(options, loader=None):
             + "\n# " + "\n# ".join(traceback.format_exc().splitlines()))
     else:
       e.args = (
-          str(utils.message(e)) + "\nFile: %s" % options.input,) + e.args[1:]
+          str(utils.message(e)) + f"\nFile: {options.input}",) + e.args[1:]
       raise
 
   return (errorlog, None, None) if options.check else (errorlog, result, ast)
@@ -247,13 +251,15 @@ def write_pickle(ast, options, loader=None):
     ast2 = ast2.Visit(visitors.ClearClassPointers())
     if not pytd_utils.ASTeq(ast1, ast2):
       raise AssertionError()
-  serialize_ast.StoreAst(ast, options.output, options.open_function)
+  pickle_utils.StoreAst(ast, options.output, options.open_function,
+                        is_package=options.module_name.endswith(".__init__"),
+                        metadata=options.pickle_metadata)
 
 
 def print_error_doc_url(errorlog):
   names = {e.name for e in errorlog}
   if names:
-    doclink = "\nFor more details, see %s" % ERROR_DOC_URL
+    doclink = f"\nFor more details, see {ERROR_DOC_URL}"
     if len(names) == 1:
       doclink += "#" + names.pop()
     print(doclink, file=sys.stderr)
@@ -266,7 +272,8 @@ def handle_errors(errorlog, options):
     return 0
 
   if options.output_errors_csv:
-    errorlog.print_to_csv_file(options.output_errors_csv, options.open_function)
+    with options.open_function(options.output_errors_csv, "w") as f:
+      errorlog.print_to_csv_file(f)
     return 0  # Command is successful regardless of errors.
 
   errorlog.print_to_stderr(color=options.color)
@@ -282,7 +289,7 @@ def parse_pyi(options):
   ast = loader.load_file(options.module_name, options.input)
   ast = loader.finish_and_verify_ast(ast)
   if options.output:
-    result = "# Internal AST parsed and postprocessed from %s\n\n%s" % (
+    result = "# Internal AST parsed and postprocessed from {}\n\n{}".format(
         options.input, pytd_utils.Print(ast))
     _write_pyi_output(options, result, options.output)
   return ast
@@ -310,16 +317,24 @@ def wrap_pytype_exceptions(exception_type, filename=""):
   try:
     yield
   except utils.UsageError as e:
-    raise exception_type("Pytype usage error: %s" % utils.message(e)) from e
+    raise exception_type(f"Pytype usage error: {utils.message(e)}") from e
   except pyc.CompileError as e:
     raise exception_type("Error reading file %s at line %s: %s" %
                          (filename, e.lineno, e.error)) from e
   except libcst.ParserSyntaxError as e:
+    # TODO(rechen): We can get rid of this branch once we delete
+    # directors.parser_libcst.
     raise exception_type("Error reading file %s at line %s: %s" %
                          (filename, e.raw_line, e.message)) from e
+  except SyntaxError as e:
+    raise exception_type("Error reading file %s at line %s: %s" %
+                         (filename, e.lineno, e.msg)) from e
   except directors.SkipFileError as e:
     raise exception_type("Pytype could not analyze file %s: "
                          "'# skip-file' directive found" % filename) from e
+  except pickle_utils.LoadPickleError as e:
+    raise exception_type(f"Error analyzing file {filename}: Could not load "
+                         f"serialized dependency {e.filename}") from e
   except Exception as e:  # pylint: disable=broad-except
-    msg = "Pytype error: %s: %s" % (e.__class__.__name__, e.args[0])
+    msg = f"Pytype error: {e.__class__.__name__}: {e.args[0]}"
     raise exception_type(msg).with_traceback(e.__traceback__)

@@ -26,6 +26,8 @@ py_library(
     config
   SRCS
     config.py
+  DEPS
+    pytype.platform_utils.platform_utils
 )
 
 py_library(
@@ -35,7 +37,8 @@ py_library(
     environment.py
   DEPS
     .runner
-    pytype.pytd.pytd
+    pytype.imports.imports
+    pytype.platform_utils.platform_utils
 )
 
 py_library(
@@ -72,7 +75,7 @@ py_test(
     config_test.py
   DEPS
     .tools
-    pytype.utils
+    pytype.tests.test_base
 )
 
 py_test(
@@ -83,6 +86,8 @@ py_test(
   DEPS
     .tools
     pytype.utils
+    pytype.platform_utils.platform_utils
+    pytype.tests.test_base
 )
 
 py_test(
@@ -92,7 +97,8 @@ py_test(
     tool_utils_test.py
   DEPS
     .tools
-    pytype.utils
+    pytype.platform_utils.platform_utils
+    pytype.tests.test_base
 )
 
 add_subdirectory(analyze_project)

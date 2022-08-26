@@ -5,7 +5,7 @@ serializing it to disk. Further users only need to read the serialized data from
 disk, which is faster to digest than a pyi file.
 """
 
-import collections
+from typing import List, NamedTuple, Optional, Set, Tuple
 
 from pytype import utils
 from pytype.pyi import parser
@@ -58,8 +58,14 @@ class UndoModuleAliasesVisitor(visitors.Visitor):
     return node
 
 
-SerializableTupleClass = collections.namedtuple(
-    "_", ["ast", "dependencies", "late_dependencies", "class_type_nodes"])
+class SerializableTupleClass(NamedTuple):
+  ast: pytd.TypeDeclUnit
+  dependencies: List[Tuple[str, Set[str]]]
+  late_dependencies: List[Tuple[str, Set[str]]]
+  class_type_nodes: Optional[List[pytd.ClassType]]
+  is_package: bool  # TODO(rechen): remove this, can be computed from src_path
+  src_path: Optional[str]
+  metadata: List[str]
 
 
 class SerializableAst(SerializableTupleClass):
@@ -73,28 +79,33 @@ class SerializableAst(SerializableTupleClass):
       Therefore it might be different from the set found by
       visitors.CollectDependencies in
       load_pytd._load_and_resolve_ast_dependencies.
+    late_dependencies: This AST's late dependencies.
     class_type_nodes: A list of all the ClassType instances in ast or None. If
       this list is provided only the ClassType instances in the list will be
       visited and have their .cls set. If this attribute is None the whole AST
       will be visited and all found ClassType instances will have their .cls
       set.
+    is_package: True if the original source file was a package __init__.
+    src_path: Optionally, the filepath of the original source file.
+    metadata: A list of arbitrary string-encoded metadata.
   """
   Replace = SerializableTupleClass._replace  # pylint: disable=no-member,invalid-name
 
 
-def StoreAst(ast, filename=None, open_function=open):
+def SerializeAst(ast, is_package=False, src_path=None, metadata=None):
   """Loads and stores an ast to disk.
 
   Args:
     ast: The pytd.TypeDeclUnit to save to disk.
-    filename: The filename for the pickled output. If this is None, this
-      function instead returns the pickled string.
-    open_function: A custom file opening function.
+    is_package: Whether the module with the given ast is a package.
+    src_path: Optionally, the filepath of the original source file.
+    metadata: A list of arbitrary string-encoded metadata.
 
   Returns:
-    The pickled string, if no filename was given. (None otherwise.)
+    The SerializableAst derived from `ast`.
   """
   if ast.name.endswith(".__init__"):
+    assert is_package
     ast = ast.Visit(visitors.RenameModuleVisitor(
         ast.name, ast.name.rsplit(".__init__", 1)[0]))
   ast = ast.Visit(UndoModuleAliasesVisitor())
@@ -109,12 +120,14 @@ def StoreAst(ast, filename=None, open_function=open):
   indexer = FindClassTypesVisitor()
   ast.Visit(indexer)
   ast = ast.Visit(visitors.CanonicalOrderingVisitor())
-  return pytd_utils.SavePickle(
-      SerializableAst(
-          ast, sorted(dependencies.items()),
-          sorted(late_dependencies.items()),
-          sorted(indexer.class_type_nodes)),
-      filename, open_function=open_function)
+
+  metadata = metadata or []
+
+  return SerializableAst(
+      ast, sorted(dependencies.items()), sorted(late_dependencies.items()),
+      sorted(indexer.class_type_nodes), is_package=is_package,
+      src_path=src_path, metadata=metadata,
+  )
 
 
 def EnsureAstName(ast, module_name, fix=False):
@@ -202,20 +215,23 @@ def _LookupClassReferences(serializable_ast, module_map, self_name):
   class_lookup = visitors.LookupExternalTypes(module_map, self_name=self_name)
   raw_ast = serializable_ast.ast
 
+  decorators = {d.type.name for c in raw_ast.classes for d in c.decorators}  # pylint: disable=g-complex-comprehension
+
   for node in (serializable_ast.class_type_nodes or ()):
     try:
+      class_lookup.allow_functions = node.name in decorators
       if node is not class_lookup.VisitClassType(node):
         serializable_ast = serializable_ast.Replace(class_type_nodes=None)
         break
     except KeyError as e:
       raise UnrestorableDependencyError(
-          "Unresolved class: %r." % utils.message(e)) from e
+          f"Unresolved class: {utils.message(e)!r}.") from e
   if serializable_ast.class_type_nodes is None:
     try:
       raw_ast = raw_ast.Visit(class_lookup)
     except KeyError as e:
       raise UnrestorableDependencyError(
-          "Unresolved class: %r." % utils.message(e)) from e
+          f"Unresolved class: {utils.message(e)!r}.") from e
   serializable_ast = serializable_ast.Replace(ast=raw_ast)
   return serializable_ast
 
@@ -230,7 +246,7 @@ def FillLocalReferences(serializable_ast, module_map):
     for node in serializable_ast.class_type_nodes:
       local_filler.EnterClassType(node)
       if node.cls is None:
-        raise AssertionError("This should not happen: %s" % str(node))
+        raise AssertionError(f"This should not happen: {str(node)}")
     return serializable_ast
 
 

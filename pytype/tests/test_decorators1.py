@@ -1,7 +1,7 @@
 """Test for function and class decorators."""
 
-from pytype import file_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class DecoratorsTest(test_base.BaseTest):
@@ -45,10 +45,10 @@ class DecoratorsTest(test_base.BaseTest):
     """)
 
   def test_bad_staticmethod(self):
-    ty = self.Infer("""
+    ty, _ = self.InferWithErrors("""
       class Foo:
         bar = 42
-        bar = staticmethod(bar)
+        bar = staticmethod(bar)  # not-callable
     """)
     self.assertTypesMatchPytd(ty, """
       from typing import Any
@@ -70,16 +70,18 @@ class DecoratorsTest(test_base.BaseTest):
     """)
 
   def test_bad_classmethod(self):
-    ty = self.Infer("""
+    ty, err = self.InferWithErrors("""
       class Foo:
         bar = 42
-        bar = classmethod(bar)
+        bar = classmethod(bar)  # not-callable[e]
     """)
     self.assertTypesMatchPytd(ty, """
       from typing import Any
       class Foo:
         bar = ...  # type: Any
     """)
+    self.assertErrorSequences(err, {
+        "e": ["int", "not callable", "@classmethod applied", "not a function"]})
 
   def test_bad_keyword(self):
     _, errors = self.InferWithErrors("""
@@ -253,7 +255,7 @@ class DecoratorsTest(test_base.BaseTest):
     """)
 
   def test_infer_called_decorated_method(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Any, Callable, List, TypeVar
         T = TypeVar("T")
@@ -315,7 +317,7 @@ class DecoratorsTest(test_base.BaseTest):
     """)
 
   def test_class_decorator(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Type, TypeVar
         _T = TypeVar("_T")

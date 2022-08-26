@@ -1,6 +1,6 @@
 """Utilities for abstract.py."""
 
-import collections
+import dataclasses
 import logging
 from typing import Any, Collection, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
@@ -8,17 +8,20 @@ from pytype import datatypes
 from pytype import utils
 from pytype.pyc import opcodes
 from pytype.pyc import pyc
+from pytype.pytd import pytd
 from pytype.typegraph import cfg
 from pytype.typegraph import cfg_utils
 
 log = logging.getLogger(__name__)
 
 # Type aliases
-ArgsDict = Dict[str, cfg.Variable]
+_ArgsDictType = Dict[str, cfg.Variable]
 
-# We can't import abstract here due to a circular dep.
-_BaseValue = Any  # abstract.BaseValue
-_TypeParameter = Any  # abstract.TypeParameter
+# We can't import some modules here due to circular deps.
+_ContextType = Any  # context.Context
+_BaseValueType = Any  # abstract.BaseValue
+_ParameterizedClassType = Any  # abstract.ParameterizedClass
+_TypeParamType = Any  # abstract.TypeParameter
 
 # Type parameter names matching the ones in builtins.pytd and typing.pytd.
 T = "_T"
@@ -102,8 +105,136 @@ class AsReturnValue(AsInstance):
 
 
 # For lazy evaluation of ParameterizedClass.formal_type_parameters
-LazyFormalTypeParameters = collections.namedtuple(
-    "LazyFormalTypeParameters", ("template", "parameters", "subst"))
+@dataclasses.dataclass(eq=True, frozen=True)
+class LazyFormalTypeParameters:
+  template: Sequence[Any]
+  parameters: Sequence[pytd.Node]
+  subst: Dict[str, cfg.Variable]
+
+
+class Local:
+  """A possibly annotated local variable."""
+
+  def __init__(
+      self, node: cfg.CFGNode, op: Optional[opcodes.Opcode],
+      typ: Optional[_BaseValueType], orig: Optional[cfg.Variable],
+      ctx: _ContextType):
+    self._ops = [op]
+    self.final = False
+    if typ:
+      self.typ = ctx.program.NewVariable([typ], [], node)
+    else:
+      # Creating too many variables bloats the typegraph, hurting performance,
+      # so we use None instead of an empty variable.
+      self.typ = None
+    self.orig = orig
+    self.ctx = ctx
+
+  @classmethod
+  def merge(cls, node, op, local1, local2):
+    """Merges two locals."""
+    ctx = local1.ctx
+    typ_values = set()
+    for typ in [local1.typ, local2.typ]:
+      if typ:
+        typ_values.update(typ.Data(node))
+    typ = ctx.convert.merge_values(typ_values) if typ_values else None
+    if local1.orig and local2.orig:
+      orig = ctx.program.NewVariable()
+      orig.PasteVariable(local1.orig, node)
+      orig.PasteVariable(local2.orig, node)
+    else:
+      orig = local1.orig or local2.orig
+    return cls(node, op, typ, orig, ctx)
+
+  def __repr__(self):
+    return f"Local(typ={self.typ}, orig={self.orig}, final={self.final})"
+
+  @property
+  def stack(self):
+    return self.ctx.vm.simple_stack(self._ops[-1])
+
+  @property
+  def last_update_op(self):
+    return self._ops[-1]
+
+  def update(self, node, op, typ, orig, final=False):
+    """Update this variable's annotation and/or value."""
+    if op in self._ops:
+      return
+    self._ops.append(op)
+    self.final = final
+    if typ:
+      if self.typ:
+        self.typ.AddBinding(typ, [], node)
+      else:
+        self.typ = self.ctx.program.NewVariable([typ], [], node)
+    if orig:
+      self.orig = orig
+
+  def get_type(self, node, name):
+    """Gets the variable's annotation."""
+    if not self.typ:
+      return None
+    values = self.typ.Data(node)
+    if len(values) > 1:
+      self.ctx.errorlog.ambiguous_annotation(self.stack, values, name)
+      return self.ctx.convert.unsolvable
+    elif values:
+      return values[0]
+    else:
+      return None
+
+
+@dataclasses.dataclass(eq=True, frozen=True)
+class BadType:
+  name: Optional[str]
+  typ: _BaseValueType
+  # Should be matcher.ErrorDetails but can't use due to circular dep.
+  error_details: Optional[Any] = None
+
+
+# The _isinstance and _make methods should be used only in pytype.abstract
+# submodules that are unable to reference abstract.py classes due to circular
+# dependencies. To prevent accidental misuse, the methods are marked private.
+# Callers are expected to alias them like so:
+#   _isinstance = abstract_utils._isinstance  # pylint: disable=protected-access
+
+
+def _isinstance(obj, name_or_names):
+  """Do an isinstance() call for a class defined in pytype.abstract.
+
+  Args:
+    obj: An instance.
+    name_or_names: A name or tuple of names of classes in pytype.abstract.
+
+  Returns:
+    Whether obj is an instance of name_or_names.
+  """
+  if not obj.__class__.__module__.startswith("pytype."):
+    return False
+  if isinstance(name_or_names, tuple):
+    names = name_or_names
+  elif name_or_names == "AMBIGUOUS_OR_EMPTY":
+    names = ("Unknown", "Unsolvable", "Empty")
+  else:
+    names = (name_or_names,)
+  obj_cls = obj.__class__
+  if obj_cls.__module__.startswith("pytype.abstract.") and obj_cls in names:
+    # Do a simple check first to avoid expensive recursive calls and mro lookup
+    # when possible.
+    return True
+  if len(names) > 1:
+    return any(_isinstance(obj, name) for name in names)
+  name = names[0]
+  return any(cls.__module__.startswith("pytype.abstract.") and
+             cls.__name__ == name for cls in obj.__class__.mro())
+
+
+def _make(cls_name, *args, **kwargs):
+  """Make an instance of cls_name with the given arguments."""
+  from pytype.abstract import abstract  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  return getattr(abstract, cls_name)(*args, **kwargs)
 
 
 # Sentinel for get_atomic_value
@@ -241,12 +372,12 @@ def apply_mutations(node, get_mutations):
   """Apply mutations yielded from a get_mutations function."""
   log.info("Applying mutations")
   num_mutations = 0
-  for obj, name, value in get_mutations():
+  for mut in get_mutations():
     if not num_mutations:
       # mutations warrant creating a new CFG node
       node = node.ConnectNew(node.name)
     num_mutations += 1
-    obj.merge_instance_type_parameter(node, name, value)
+    mut.instance.merge_instance_type_parameter(node, mut.name, mut.value)
   log.info("Applied %d mutations", num_mutations)
   return node
 
@@ -302,7 +433,7 @@ def _merge_type(t0, t1, name, cls):
   # t1 is a base of t0
   if t1 in t0.mro:
     return t0
-  raise GenericTypeError(cls, "Conflicting value for TypeVar %s" % name)
+  raise GenericTypeError(cls, f"Conflicting value for TypeVar {name}")
 
 
 def parse_formal_type_parameters(
@@ -486,92 +617,20 @@ def get_annotations_dict(members):
   return annots if _isinstance(annots, "AnnotationsDict") else None
 
 
-class Local:
-  """A possibly annotated local variable."""
-
-  def __init__(self, node, op: Optional[opcodes.Opcode],
-               typ: Optional[_BaseValue], orig: Optional[cfg.Variable], ctx):
-    self._ops = [op]
-    self.final = False
-    if typ:
-      self.typ = ctx.program.NewVariable([typ], [], node)
-    else:
-      # Creating too many variables bloats the typegraph, hurting performance,
-      # so we use None instead of an empty variable.
-      self.typ = None
-    self.orig = orig
-    self.ctx = ctx
-
-  @classmethod
-  def merge(cls, node, op, local1, local2):
-    """Merges two locals."""
-    ctx = local1.ctx
-    typ_values = set()
-    for typ in [local1.typ, local2.typ]:
-      if typ:
-        typ_values.update(typ.Data(node))
-    typ = ctx.convert.merge_values(typ_values) if typ_values else None
-    if local1.orig and local2.orig:
-      orig = ctx.program.NewVariable()
-      orig.PasteVariable(local1.orig, node)
-      orig.PasteVariable(local2.orig, node)
-    else:
-      orig = local1.orig or local2.orig
-    return cls(node, op, typ, orig, ctx)
-
-  def __repr__(self):
-    return f"Local(typ={self.typ}, orig={self.orig}, final={self.final})"
-
-  @property
-  def stack(self):
-    return self.ctx.vm.simple_stack(self._ops[-1])
-
-  @property
-  def last_update_op(self):
-    return self._ops[-1]
-
-  def update(self, node, op, typ, orig, final=False):
-    """Update this variable's annotation and/or value."""
-    if op in self._ops:
-      return
-    self._ops.append(op)
-    self.final = final
-    if typ:
-      if self.typ:
-        self.typ.AddBinding(typ, [], node)
-      else:
-        self.typ = self.ctx.program.NewVariable([typ], [], node)
-    if orig:
-      self.orig = orig
-
-  def get_type(self, node, name):
-    """Gets the variable's annotation."""
-    if not self.typ:
-      return None
-    values = self.typ.Data(node)
-    if len(values) > 1:
-      self.ctx.errorlog.ambiguous_annotation(self.stack, values, name)
-      return self.ctx.convert.unsolvable
-    elif values:
-      return values[0]
-    else:
-      return None
-
-
-def is_concrete_dict(val: _BaseValue):
+def is_concrete_dict(val: _BaseValueType) -> bool:
   return _isinstance(val, "Dict") and not val.could_contain_anything
 
 
-def is_concrete_list(val: _BaseValue):
+def is_concrete_list(val: _BaseValueType) -> bool:
   return _isinstance(val, "List") and not val.could_contain_anything
 
 
-def is_concrete(val: _BaseValue):
+def is_concrete(val: _BaseValueType) -> bool:
   return (_isinstance(val, "PythonConstant") and
           not getattr(val, "could_contain_anything", False))
 
 
-def is_indefinite_iterable(val: _BaseValue):
+def is_indefinite_iterable(val: _BaseValueType) -> bool:
   """True if val is a non-concrete instance of typing.Iterable."""
   instance = _isinstance(val, "Instance")
   concrete = is_concrete(val)
@@ -617,7 +676,7 @@ def unwrap_splat(var):
   return var.data[0].iterable
 
 
-def is_callable(value: _BaseValue):
+def is_callable(value: _BaseValueType) -> bool:
   """Returns whether 'value' is a callable."""
   if _isinstance(
       value, ("Function", "BoundFunction", "ClassMethod", "StaticMethod")):
@@ -642,7 +701,7 @@ def expand_type_parameter_instances(bindings: Iterable[cfg.Binding]):
 
 
 def get_type_parameter_substitutions(
-    val: _BaseValue, type_params: Iterable[_TypeParameter]
+    val: _BaseValueType, type_params: Iterable[_TypeParamType]
 ) -> Mapping[str, cfg.Variable]:
   """Get values for type_params from val's type parameters."""
   subst = {}
@@ -657,8 +716,8 @@ def get_type_parameter_substitutions(
 
 
 def build_generic_template(
-    type_params: Sequence[_BaseValue], base_type: _BaseValue
-) -> Tuple[Sequence[str], Sequence[_TypeParameter]]:
+    type_params: Sequence[_BaseValueType], base_type: _BaseValueType
+) -> Tuple[Sequence[str], Sequence[_TypeParamType]]:
   """Build a typing.Generic template from a sequence of type parameters."""
   if not all(_isinstance(item, "TypeParameter") for item in type_params):
     base_type.ctx.errorlog.invalid_annotation(
@@ -677,7 +736,7 @@ def build_generic_template(
   return template, type_params
 
 
-def is_generic_protocol(val: _BaseValue) -> bool:
+def is_generic_protocol(val: _BaseValueType) -> bool:
   return (_isinstance(val, "ParameterizedClass") and
           val.full_name == "typing.Protocol")
 
@@ -782,49 +841,6 @@ def unwrap_final(val):
   return val
 
 
-# The _isinstance and _make methods should be used only in pytype.abstract
-# submodules that are unable to reference abstract.py classes due to circular
-# dependencies. To prevent accidental misuse, the methods are marked private.
-# Callers are expected to alias them like so:
-#   _isinstance = abstract_utils._isinstance  # pylint: disable=protected-access
-
-
-def _isinstance(obj, name_or_names):
-  """Do an isinstance() call for a class defined in pytype.abstract.
-
-  Args:
-    obj: An instance.
-    name_or_names: A name or tuple of names of classes in pytype.abstract.
-
-  Returns:
-    Whether obj is an instance of name_or_names.
-  """
-  if not obj.__class__.__module__.startswith("pytype."):
-    return False
-  if isinstance(name_or_names, tuple):
-    names = name_or_names
-  elif name_or_names == "AMBIGUOUS_OR_EMPTY":
-    names = ("Unknown", "Unsolvable", "Empty")
-  else:
-    names = (name_or_names,)
-  obj_cls = obj.__class__
-  if obj_cls.__module__.startswith("pytype.abstract.") and obj_cls in names:
-    # Do a simple check first to avoid expensive recursive calls and mro lookup
-    # when possible.
-    return True
-  if len(names) > 1:
-    return any(_isinstance(obj, name) for name in names)
-  name = names[0]
-  return any(cls.__module__.startswith("pytype.abstract.") and
-             cls.__name__ == name for cls in obj.__class__.mro())
-
-
-def _make(cls_name, *args, **kwargs):
-  """Make an instance of cls_name with the given arguments."""
-  from pytype.abstract import abstract  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
-  return getattr(abstract, cls_name)(*args, **kwargs)
-
-
 def is_recursive_annotation(annot):
   return annot.is_late_annotation() and annot.is_recursive()
 
@@ -834,10 +850,55 @@ def is_ellipsis(val):
           (is_concrete(val) and val.pyval == "..."))
 
 
-def update_args_dict(args: ArgsDict, update: ArgsDict, node: cfg.CFGNode):
+def update_args_dict(
+    args: _ArgsDictType, update: _ArgsDictType, node: cfg.CFGNode) -> None:
   """Update a {str: Variable} dict by merging bindings."""
   for k, v in update.items():
     if k in args:
       args[k].PasteVariable(v, node)
     else:
       args[k] = v
+
+
+def show_constant(val: _BaseValueType) -> str:
+  """Pretty-print a value if it is a constant.
+
+  Recurses into a constant, printing the underlying Python value for constants
+  and just using "..." for everything else (e.g., Variables). This is useful for
+  generating clear error messages that show the exact values related to an error
+  while preventing implementation details from leaking into the message.
+
+  Args:
+    val: an abstract value.
+
+  Returns:
+    A string of the pretty-printed constant.
+  """
+  def _ellipsis_printer(v):
+    if _isinstance(v, "PythonConstant"):
+      return v.str_of_constant(_ellipsis_printer)
+    return "..."
+  return _ellipsis_printer(val)
+
+
+def get_generic_type(val: _BaseValueType) -> Optional[_ParameterizedClassType]:
+  """Gets the generic type of an abstract value.
+
+  Args:
+    val: The abstract value.
+
+  Returns:
+    The type of the value, with concrete type parameters replaced by TypeVars.
+    For example, the generic type of `[0]` is `List[T]`.
+  """
+  if not _isinstance(val.cls, "Class") or val.cls.full_name == "builtins.type":
+    return None
+  for cls in val.cls.mro:
+    if _isinstance(cls, "ParameterizedClass"):
+      base_cls = cls.base_cls
+    else:
+      base_cls = cls
+    if _isinstance(base_cls, "Class") and base_cls.template:
+      params = {item.name: item for item in base_cls.template}
+      return _make("ParameterizedClass", base_cls, params, base_cls.ctx)
+  return None

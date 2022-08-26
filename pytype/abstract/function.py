@@ -1,13 +1,20 @@
 """Representation of Python function headers and calls."""
 
 import collections
+import dataclasses
 import itertools
 import logging
+from typing import Dict, Optional, Sequence, Tuple
+
+import attrs
 
 from pytype import datatypes
+from pytype.abstract import _base
 from pytype.abstract import abstract_utils
 from pytype.pytd import pytd
 from pytype.pytd import pytd_utils
+from pytype.typegraph import cfg
+from pytype.typegraph import cfg_utils
 
 log = logging.getLogger(__name__)
 _isinstance = abstract_utils._isinstance  # pylint: disable=protected-access
@@ -30,8 +37,18 @@ def get_signatures(func):
     return [sig.drop_first_parameter() for sig in sigs]  # drop "self"
   elif _isinstance(func, ("ClassMethod", "StaticMethod")):
     return get_signatures(func.method)
-  elif _isinstance(func, "SimpleFunction"):
+  elif _isinstance(func, "SignedFunction"):
     return [func.signature]
+  elif _isinstance(func, "AMBIGUOUS_OR_EMPTY"):
+    return [Signature.from_any()]
+  elif func.__class__.__name__ == "PropertyInstance":
+    # NOTE: We typically do not want to treat a PropertyInstance as a callable.
+    # This check is here due to a crash in the matcher when applying a method
+    # decorator to a property, e.g.
+    #   @abstractmethod
+    #   @property
+    #   def f()...
+    return []
   elif _isinstance(func.cls, "CallableClass"):
     return [Signature.from_callable(func.cls)]
   else:
@@ -246,22 +263,36 @@ class Signature:
         annotations={},
     )
 
+  @classmethod
+  def from_any(cls):
+    """Treat `Any` as `f(...) -> Any`."""
+    return cls(
+        name="<callable>",
+        param_names=(),
+        posonly_count=0,
+        varargs_name="args",
+        kwonly_params=(),
+        kwargs_name="kwargs",
+        defaults={},
+        annotations={},
+    )
+
   def has_param(self, name):
     return name in self.param_names or name in self.kwonly_params or (
         name == self.varargs_name or name == self.kwargs_name)
 
-  def insert_varargs_and_kwargs(self, arg_dict):
-    """Insert varargs and kwargs from arg_dict into the signature.
+  def insert_varargs_and_kwargs(self, args):
+    """Insert varargs and kwargs from args into the signature.
 
     Args:
-      arg_dict: A name->binding dictionary of passed args.
+      args: An iterable of passed arg names.
 
     Returns:
       A copy of this signature with the passed varargs and kwargs inserted.
     """
     varargs_names = []
     kwargs_names = []
-    for name in arg_dict:
+    for name in args:
       if self.has_param(name):
         continue
       if pytd_utils.ANON_PARAM.match(name):
@@ -348,46 +379,43 @@ class Signature:
     if name in self.defaults:
       values = self.defaults[name].data
       if len(values) > 1:
-        return "Union[%s]" % ", ".join(_print(v) for v in values)
+        return "..."
       else:
-        return _print(values[0])
+        return abstract_utils.show_constant(values[0])
     else:
       return None
 
   def __repr__(self):
     args = ", ".join(self._yield_arguments())
     ret = self._print_annot("return")
-    return "def {name}({args}) -> {ret}".format(
-        name=self.name, args=args, ret=ret if ret else "Any")
+    return f"def {self.name}({args}) -> {ret if ret else 'Any'}"
 
   def get_first_arg(self, callargs):
     return callargs.get(self.param_names[0]) if self.param_names else None
 
 
-class Args(collections.namedtuple(
-    "Args", ["posargs", "namedargs", "starargs", "starstarargs"])):
-  """Represents the parameters of a function call."""
+def _convert_namedargs(namedargs):
+  return {} if namedargs is None else namedargs
 
-  def __new__(cls, posargs, namedargs=None, starargs=None, starstarargs=None):
-    """Create arguments for a function under analysis.
 
-    Args:
-      posargs: The positional arguments. A tuple of cfg.Variable.
-      namedargs: The keyword arguments. A dictionary, mapping strings to
-        cfg.Variable.
-      starargs: The *args parameter, or None.
-      starstarargs: The **kwargs parameter, or None.
-    Returns:
-      An Args instance.
-    """
-    assert isinstance(posargs, tuple), posargs
-    cls.replace = cls._replace
-    return super().__new__(
-        cls,
-        posargs=posargs,
-        namedargs=namedargs or {},
-        starargs=starargs,
-        starstarargs=starstarargs)
+@attrs.frozen(eq=True)
+class Args:
+  """Represents the parameters of a function call.
+
+  Attributes:
+    posargs: The positional arguments. A tuple of cfg.Variable.
+    namedargs: The keyword arguments. A dictionary, mapping strings to
+      cfg.Variable.
+    starargs: The *args parameter, or None.
+    starstarargs: The **kwargs parameter, or None.
+
+  """
+
+  posargs: Tuple[cfg.Variable, ...]
+  namedargs: Dict[str, cfg.Variable] = attrs.field(converter=_convert_namedargs,
+                                                   default=None)
+  starargs: Optional[cfg.Variable] = None
+  starstarargs: Optional[cfg.Variable] = None
 
   def has_namedargs(self):
     return bool(self.namedargs)
@@ -578,16 +606,19 @@ class Args(collections.namedtuple(
 
   def replace_posarg(self, pos, val):
     new_posargs = self.posargs[:pos] + (val,) + self.posargs[pos + 1:]
-    return self._replace(posargs=new_posargs)
+    return self.replace(posargs=new_posargs)
 
   def replace_namedarg(self, name, val):
     new_namedargs = dict(self.namedargs)
     new_namedargs[name] = val
-    return self._replace(namedargs=new_namedargs)
+    return self.replace(namedargs=new_namedargs)
 
   def delete_namedarg(self, name):
     new_namedargs = {k: v for k, v in self.namedargs.items() if k != name}
-    return self._replace(namedargs=new_namedargs)
+    return self.replace(namedargs=new_namedargs)
+
+  def replace(self, **kwargs):
+    return attrs.evolve(self, **kwargs)
 
 
 class ReturnValueMixin:
@@ -648,14 +679,11 @@ class DictKeyMissing(Exception, ReturnValueMixin):
     return not self.__gt__(other)
 
 
-BadCall = collections.namedtuple("_", ["sig", "passed_args", "bad_param"])
-
-
-class BadParam(
-    collections.namedtuple("_", ["name", "expected", "error_details"])):
-
-  def __new__(cls, name, expected, error_details=None):
-    return super().__new__(cls, name, expected, error_details)
+@dataclasses.dataclass(eq=True, frozen=True)
+class BadCall:
+  sig: Signature
+  passed_args: Sequence[Tuple[str, _base.BaseValue]]
+  bad_param: Optional[abstract_utils.BadType]
 
 
 class InvalidParameters(FailedFunctionCall):
@@ -719,7 +747,13 @@ class MissingParameter(InvalidParameters):
 # pylint: enable=g-bad-exception-name
 
 
-class Mutation(collections.namedtuple("_", ["instance", "name", "value"])):
+@dataclasses.dataclass(frozen=True)
+class Mutation:
+  """A type mutation."""
+
+  instance: _base.BaseValue
+  name: str
+  value: cfg.Variable
 
   def __eq__(self, other):
     return (self.instance == other.instance and
@@ -818,8 +852,7 @@ def call_function(ctx,
   if (nodes and not ctx.options.strict_parameter_checks) or not error:
     return node, result
   elif fallback_to_unsolvable:
-    if not isinstance(error, DictKeyMissing):
-      ctx.errorlog.invalid_function_call(ctx.vm.stack(func_var.data[0]), error)
+    ctx.errorlog.invalid_function_call(ctx.vm.stack(func_var.data[0]), error)
     return node, result
   else:
     # We were called by something that does its own error handling.
@@ -876,8 +909,8 @@ def match_all_args(ctx, node, func, args):
           break
         else:
           raise AssertionError(
-              "Mismatched parameter %s not found in passed_args" %
-              arg_name) from e
+              f"Mismatched parameter {arg_name} not found in passed_args"
+          ) from e
       else:
         # This is not an InvalidParameters error.
         raise
@@ -885,3 +918,24 @@ def match_all_args(ctx, node, func, args):
       needs_checking = False
 
   return args, errors
+
+
+def match_succeeded(match_result, match_all_views, ctx):
+  bad_matches, substs = match_result
+  if not bad_matches:
+    return True
+  if match_all_views or ctx.options.strict_parameter_checks:
+    return False
+  return bool(substs)
+
+
+def has_visible_namedarg(node, args, names):
+  # Note: this method should be called judiciously, as HasCombination is
+  # potentially very expensive.
+  namedargs = {args.namedargs[name] for name in names}
+  variables = [v for v in args.get_variables() if v not in namedargs]
+  for name in names:
+    for view in cfg_utils.variable_product(variables + [args.namedargs[name]]):
+      if node.HasCombination(list(view)):
+        return True
+  return False

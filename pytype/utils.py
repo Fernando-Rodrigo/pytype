@@ -3,16 +3,13 @@
 import collections
 import contextlib
 import itertools
-import os.path
 import re
-import subprocess
-import sys
 import threading
 import traceback
-from typing import Iterable, List
+from typing import Union
 import weakref
 
-from pytype import pytype_source_utils
+from pytype.platform_utils import path_utils
 
 
 # We disable the check that keeps pytype from running on not-yet-supported
@@ -20,7 +17,7 @@ from pytype import pytype_source_utils
 # to test upcoming versions.
 def _validate_python_version_upper_bound():
   for frame_summary in traceback.extract_stack():
-    head, tail = os.path.split(frame_summary.filename)
+    head, tail = path_utils.split(frame_summary.filename)
     if "/pytype/" in head + "/" and (
         tail.startswith("test_") or tail.endswith("_test.py")):
       return False
@@ -139,75 +136,12 @@ def concat_tuples(tuples):
   return tuple(itertools.chain.from_iterable(tuples))
 
 
-def native_str(s, errors="strict"):
+def native_str(s: Union[str, bytes], errors: str = "strict") -> str:
   """Convert a bytes object to the native str type."""
   if isinstance(s, str):
     return s
   else:
-    assert isinstance(s, bytes)
     return s.decode("utf-8", errors)
-
-
-def get_python_exes(python_version) -> Iterable[List[str]]:
-  """Find possible python executables to use.
-
-  Arguments:
-    python_version: the version tuple (e.g. (3, 7))
-  Yields:
-    The path to the executable
-  """
-  # Use custom interpreters, if provided, in preference to the ones in $PATH
-  custom_python_exe = pytype_source_utils.get_custom_python_exe(python_version)
-  if custom_python_exe:
-    yield [custom_python_exe]
-    return
-  for version in (format_version(python_version), "3"):
-    if sys.platform == "win32":
-      python_exe = ["py", f"-{version}"]
-    else:
-      python_exe = [f"python{version}"]
-    yield python_exe
-
-
-def get_python_exe_version(python_exe: List[str]):
-  """Determine the major and minor version of given Python executable.
-
-  Arguments:
-    python_exe: absolute path to the Python executable
-  Returns:
-    Version as (major, minor) tuple.
-  """
-  try:
-    python_exe_version = subprocess.check_output(
-        python_exe + ["-V"], stderr=subprocess.STDOUT).decode()
-  except (subprocess.CalledProcessError, FileNotFoundError):
-    return None
-
-  return parse_exe_version_string(python_exe_version)
-
-
-def parse_exe_version_string(version_str):
-  """Parse the version string of a Python executable.
-
-  Arguments:
-    version_str: Version string as emitted by running `PYTHON_EXE -V`
-  Returns:
-    Version as (major, minor) tuple.
-  """
-  # match the major.minor part of the version string, ignore the micro part
-  matcher = re.search(r"Python (\d+\.\d+)\.\d+", version_str)
-
-  if matcher:
-    return version_from_string(matcher.group(1))
-  else:
-    return None
-
-
-def can_compile_bytecode_natively(python_version):
-  # Optimization: calling compile_bytecode directly is faster than spawning a
-  # subprocess and lets us avoid extracting a large Python executable into /tmp.
-  # We can do this only when the host and target versions match.
-  return python_version == sys.version_info[:2]
 
 
 def list_startswith(l, prefix):

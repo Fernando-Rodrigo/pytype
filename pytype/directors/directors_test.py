@@ -1,12 +1,11 @@
-# coding=utf8
 """Tests for directors.py."""
 
 import sys
 import textwrap
 
 from pytype import blocks
-from pytype import directors
 from pytype import errors
+from pytype.directors import directors
 from pytype.pyc import pyc
 import unittest
 
@@ -106,7 +105,7 @@ class DirectorTestCase(unittest.TestCase):
 
   @classmethod
   def setUpClass(cls):
-    super(DirectorTestCase, cls).setUpClass()
+    super().setUpClass()
     # Invoking the _error_name decorator will register the name as a valid
     # error name.
     for name in ["test-error", "test-other-error"]:
@@ -132,7 +131,7 @@ class DirectorTestCase(unittest.TestCase):
         lineno=lineno)
     self.assertEqual(
         expected,
-        self._director.should_report_error(error))
+        self._director.filter_error(error))
 
 
 class DirectorTest(DirectorTestCase):
@@ -374,6 +373,21 @@ class DirectorTest(DirectorTestCase):
       src.append(f"    'string{i}'")
     src.append(")")
     self._create("\n".join(src))
+
+  def test_try(self):
+    self._create("""
+      try:
+        x = None  # type: int
+      except Exception:
+        x = None  # type: str
+      else:
+        x = None  # type: float
+    """)
+    self.assertEqual({
+        3: "int",
+        5: "str",
+        7: "float",
+    }, self._director.type_comments)
 
 
 class VariableAnnotationsTest(DirectorTestCase):
@@ -683,6 +697,20 @@ class DisableDirectivesTest(DirectorTestCase):
     """)
     self.assertDisables(5)
 
+  def test_nested_compare(self):
+    self._create("""
+      f(
+        a,
+        b,
+        (c <
+         d)  # pytype: disable=wrong-arg-types
+      )
+    """)
+    if self.python_version >= (3, 8):
+      self.assertDisables(2, 5, 6)
+    else:
+      self.assertDisables(6)
+
   def test_iterate(self):
     self._create("""
       class Foo:
@@ -843,6 +871,61 @@ class DisableDirectivesTest(DirectorTestCase):
       self.assertDisables(2, 3, error_class="attribute-error")
     else:
       self.assertDisables(3, error_class="attribute-error")
+
+  def test_try(self):
+    self._create("""
+      try:
+        pass
+      except NonsenseError:  # pytype: disable=name-error
+        pass
+    """)
+    self.assertDisables(4, error_class="name-error")
+
+  def test_classdef(self):
+    self._create("""
+      import abc
+      class Foo:  # pytype: disable=ignored-abstractmethod
+        @abc.abstractmethod
+        def f(self): ...
+    """)
+    self.assertDisables(3, error_class="ignored-abstractmethod")
+
+  def test_class_attribute(self):
+    self._create("""
+      class Foo:
+        x: 0  # pytype: disable=invalid-annotation
+    """)
+    self.assertDisables(3, error_class="invalid-annotation")
+
+  def test_nested_call_in_function_decorator(self):
+    self._create("""
+      @decorate(
+        dict(
+          k1=v(
+            a, b, c),  # pytype: disable=wrong-arg-types
+          k2=v2))
+      def f():
+        pass
+    """)
+    if self.python_version >= (3, 8):
+      self.assertDisables(2, 3, 4, 5)
+    else:
+      self.assertDisables(5)
+
+  def test_nested_call_in_class_decorator(self):
+    self._create("""
+      @decorate(
+        dict(
+          k1=v(
+            a, b, c),  # pytype: disable=wrong-arg-types
+          k2=v2))
+      class C:
+        pass
+    """)
+    if self.python_version >= (3, 8):
+      self.assertDisables(2, 3, 4, 5)
+    else:
+      self.assertDisables(5)
 
 
 if __name__ == "__main__":

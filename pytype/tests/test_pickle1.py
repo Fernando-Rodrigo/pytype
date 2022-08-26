@@ -3,10 +3,11 @@
 import pickle
 import textwrap
 
-from pytype import file_utils
+from pytype.imports import pickle_utils
 from pytype.pyi import parser
 from pytype.pytd import visitors
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class PickleTest(test_base.BaseTest):
@@ -35,7 +36,7 @@ class PickleTest(test_base.BaseTest):
     pickled = self.Infer("""
       x = type
     """, deep=False, pickle=True, module_name="foo")
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       u = d.create_file("u.pickled", pickled)
       ty = self.Infer("""
         import u
@@ -49,33 +50,33 @@ class PickleTest(test_base.BaseTest):
 
   def test_copy_class_into_output(self):
     pickled_foo = self.Infer("""
-      import asyncore
+      import datetime
       a = 42
-      file_dispatcher = asyncore.file_dispatcher  # copy class
+      timedelta = datetime.timedelta  # copy class
     """, deep=False, pickle=True, module_name="foo")
-    self._verifyDeps(pickled_foo, ["builtins"], ["asyncore"])
-    with file_utils.Tempdir() as d:
+    self._verifyDeps(pickled_foo, ["builtins"], ["datetime"])
+    with test_utils.Tempdir() as d:
       foo = d.create_file("foo.pickled", pickled_foo)
       pickled_bar = self.Infer("""
         import foo
-        file_dispatcher = foo.file_dispatcher  # copy class
+        timedelta = foo.timedelta  # copy class
       """, pickle=True, pythonpath=[""],
                                imports_map={"foo": foo}, module_name="bar")
-      self._verifyDeps(pickled_bar, ["builtins"], ["asyncore"])
+      self._verifyDeps(pickled_bar, ["builtins"], ["datetime"])
       bar = d.create_file("bar.pickled", pickled_bar)
       ty = self.Infer("""
         import bar
-        r = bar.file_dispatcher(0)
+        r = bar.timedelta(0)
       """, deep=False, pythonpath=[""], imports_map={"foo": foo, "bar": bar})
-      self._verifyDeps(ty, ["asyncore"], [])
+      self._verifyDeps(ty, ["datetime"], [])
       self.assertTypesMatchPytd(ty, """
-        import asyncore
+        import datetime
         import bar
-        r = ...  # type: asyncore.file_dispatcher
+        r = ...  # type: datetime.timedelta
       """)
 
   def test_optimize_on_late_types(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       pickled_foo = self.Infer("""
         class X: pass
       """, deep=False, pickle=True, module_name="foo")
@@ -96,7 +97,7 @@ class PickleTest(test_base.BaseTest):
       """, deep=False, imports_map={"foo": foo, "bar": bar})
 
   def test_file_change(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       pickled_xy = self.Infer("""
         class X: pass
         class Y: pass
@@ -129,7 +130,7 @@ class PickleTest(test_base.BaseTest):
       """, deep=False, imports_map={"foo": foo, "bar": bar})
 
   def test_file_rename(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       pickled_other_foo = self.Infer("""
         class Foo: pass
       """, deep=False, pickle=True, module_name="bar")
@@ -149,7 +150,7 @@ class PickleTest(test_base.BaseTest):
                  module_name="baz")
 
   def test_optimize(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       pickled_foo = self.PicklePyi("""
         import UserDict
         class Foo: ...
@@ -175,7 +176,7 @@ class PickleTest(test_base.BaseTest):
         import UserDict
         def f(x: UserDict.UserDict) -> None: ...
       """, module_name="foo")
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       foo = d.create_file("foo.pickled", pickled_foo)
       self.options.tweak(imports_map={"foo": foo})
       pickled_bar = self.PicklePyi("""
@@ -186,6 +187,36 @@ class PickleTest(test_base.BaseTest):
         import bar
         bar.f(42)
       """, imports_map={"foo": foo, "bar": bar}, module_name="baz")
+
+  def test_class_decorator(self):
+    foo = """
+      from typing_extensions import final
+      @final
+      class A:
+        def f(self): ...
+    """
+    with self.DepTree([("foo.py", foo, {"pickle": True})]):
+      self.CheckWithErrors("""
+        import foo
+        class B(foo.A):  # final-error
+          pass
+      """)
+
+  def test_exception(self):
+    old = pickle.load
+    def load_with_error(*args, **kwargs):
+      raise ValueError("error!")
+    foo = """
+      class A: pass
+    """
+    pickle.load = load_with_error
+    with self.DepTree([("foo.py", foo, {"pickle": True})]):
+      with self.assertRaises(pickle_utils.LoadPickleError):
+        self.Check("""
+          import foo
+          x = foo.A()
+        """)
+    pickle.load = old
 
 
 if __name__ == "__main__":

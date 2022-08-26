@@ -4,7 +4,9 @@ import collections
 import dataclasses
 import re
 import sys
-from typing import Any, List, Optional
+import textwrap
+import types
+from typing import Any, List, Optional, Type, TypeVar
 
 from pytype import analyze
 from pytype import config
@@ -47,6 +49,8 @@ IMPORT_FILE_MARKER = "<__FILE__>"
 # Marker to capture a pending return value while traversing an AST
 _RETURNING_NAME = "RETURNING NAME"
 
+_T = TypeVar("_T")
+
 
 def qualified_method(data):
   """Fully qualify a method call with its class scope."""
@@ -62,6 +66,17 @@ def get_location(node):
   return source.Location(node.lineno, node.col_offset)
 
 
+def get_end_location(node):
+  # These attributes are new in Python 3.8.
+  if sys.version_info[:2] >= (3, 8):
+    end_lineno = node.end_lineno
+    end_col_offset = node.end_col_offset
+  else:
+    end_lineno = node.lineno
+    end_col_offset = node.col_offset
+  return source.Location(end_lineno, end_col_offset)
+
+
 def match_opcodes(opcode_traces, lineno, op_match_list):
   """Get all opcodes matching op_match_list on a given line.
 
@@ -74,10 +89,10 @@ def match_opcodes(opcode_traces, lineno, op_match_list):
     A list of matching opcodes.
   """
   out = []
-  for op, symbol, data in opcode_traces[lineno]:
+  for trace in opcode_traces[lineno]:
     for match_op, match_symbol in op_match_list:
-      if op == match_op and match_symbol in [None, symbol]:
-        out.append((op, symbol, data))
+      if trace.op == match_op and match_symbol in [None, trace.symbol]:
+        out.append((trace.op, trace.symbol, trace.types))
   return out
 
 
@@ -114,8 +129,7 @@ class PytypeValue:
     self.id = self.module + "." + self.name
 
   def format(self):
-    return "%s { %s.%s : %s }" % (
-        self.id, self.module, self.typ, self.name)
+    return f"{self.id} {{ {self.module}.{self.typ} : {self.name} }}"
 
   @classmethod
   def _from_data(cls, data):
@@ -180,7 +194,7 @@ class DocString:
   length: int
 
   @classmethod
-  def from_node(cls, ast, node):
+  def from_node(cls: Type[_T], ast: types.ModuleType, node) -> Optional[_T]:
     """If the first element in node.body is a string, create a docstring."""
 
     # This should only be called on ClassDef and FunctionDef
@@ -191,6 +205,10 @@ class DocString:
       doc_node = node.body[0]
       doc = doc_node.value.s
       length = len(doc)  # we want to preserve the byte length
+      # strip indentation from multiline docstrings
+      if "\n" in doc:
+        first, rest = doc.split("\n", 1)
+        doc = first + "\n" + textwrap.dedent(rest).rstrip()
       return cls(doc, get_location(doc_node), length)
     return None
 
@@ -362,6 +380,7 @@ class Funcall:
   scope: str
   func: str
   location: source.Location
+  end_location: source.Location
   args: List[Any]
   return_type: str
 
@@ -470,7 +489,7 @@ class ScopedVisitor(ast_visitor.BaseVisitor):
     elif c == self._ast.Module:
       return self.module_name
     else:
-      raise Exception("Unexpected scope: %r" % node)
+      raise Exception(f"Unexpected scope: {node!r}")
 
   def iprint(self, x):
     """Print messages indented by scope level, for debugging."""
@@ -545,6 +564,9 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
     self.classmap = {}
     self.calls = []
     self.function_params = []
+    # Record childof relationships for nested functions/classes
+    self.childof = []
+    self.scope_defn = {}
 
   def _get_location(self, node, args):
     """Get a more accurate node location."""
@@ -557,11 +579,11 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
       # between the start of the AST node and the start of the body. Handles the
       # offset for decorated functions/classes.
       body_start = node.body[0].lineno
-      text = "class %s" % args["name"]
+      text = f"class {args['name']}"
       loc = self.source.find_first_text(node.lineno, body_start, text)
     elif isinstance(node, self._ast.FunctionDef):
       body_start = node.body[0].lineno
-      text = "def %s" % args["name"]
+      text = f"def {args['name']}"
       loc = self.source.find_first_text(node.lineno, body_start, text)
 
     if loc is None:
@@ -653,8 +675,10 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
     return self.add_local_ref(node, **kwargs)
 
   def add_call(self, node, name, func, arg_varnames, return_type):
+    start = get_location(node)
+    end = get_end_location(node)
     self.calls.append(
-        Funcall(name, self.scope_id(), func, get_location(node), arg_varnames,
+        Funcall(name, self.scope_id(), func, start, end, arg_varnames,
                 return_type))
 
   def add_attr(self, node):
@@ -669,6 +693,12 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
       if isinstance(d, self._ast.Name) and d.id == decorator:
         return True
     return False
+
+  def _record_childof(self, node, defn):
+    """Record a childof relationship for nested definitions."""
+    parent = self.scope_defn.get(self.scope_id())
+    if parent:
+      self.childof.append((defn, parent))
 
   def enter_ClassDef(self, node):
     class_name = node_utils.get_name(node, self._ast)
@@ -697,8 +727,10 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
         class_name, node.lineno)
     defn = self.add_local_def(node, data=data,
                               doc=DocString.from_node(self._ast, node))
+    self._record_childof(node, defn)
     self.classmap[d[0]] = defn
     super().enter_ClassDef(node)
+    self.scope_defn[self.scope_id()] = defn
 
   def enter_FunctionDef(self, node):
     last_line = max(node.lineno, node.body[0].lineno - 1)
@@ -714,7 +746,9 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
       data = None
     fn_def = self.add_local_def(node, data=data,
                                 doc=DocString.from_node(self._ast, node))
+    self._record_childof(node, fn_def)
     env = self.add_scope(node)
+    self.scope_defn[self.scope_id()] = fn_def
     # TODO(mdemello): Get pytype data for params
     params = [self.add_local_def(v) for v in node.args.args]
     for i, param in enumerate(params):
@@ -733,7 +767,10 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
     # same location anyways.
     # We use pytype trace data to distinguish between local and global
     # variables.
-    for unused_loc, (op, symbol, data) in self.match(node):
+    for unused_loc, trace in self.match(node):
+      op = trace.op
+      symbol = trace.symbol
+      data = trace.types
       d = _unwrap(data)
       ref = None
       if op == "LOAD_GLOBAL":
@@ -761,8 +798,8 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
     # We have replaced Name() in args with the corresponding string
     arg_varnames = [x for x in node.args if isinstance(x, str)]
     seen = set()
-    for _, (_, _, data) in self.match(node):
-      call, return_type = data
+    for _, trace in self.match(node):
+      call, return_type = trace.types
       if call is None:
         continue
       for d in call:
@@ -782,17 +819,17 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
     # match() returns the location of the attribute, whereas the indexer needs
     # the location of the value on which the attribute is accessed, in order to
     # link function calls. We'll manually adjust the location later.
-    for unused_loc, (op, unused_symbol, data) in self.match(node):
-      if op in ("LOAD_ATTR", "LOAD_METHOD"):
+    for unused_loc, trace in self.match(node):
+      if trace.op in ("LOAD_ATTR", "LOAD_METHOD"):
         ref = self.add_local_ref(
             node,
             target=node.value,
             name=node_str,
-            data=data)
-        if len(data) == 2:
-          _, rhs = data
+            data=trace.types)
+        if len(trace.types) == 2:
+          _, rhs = trace.types
           self.typemap[ref.id] = rhs
-      elif op == "STORE_ATTR":
+      elif trace.op == "STORE_ATTR":
         defn = self.add_local_def(node)
         if self.current_class:
           # We only support attr definitions within a class definition.
@@ -811,10 +848,13 @@ class IndexVisitor(ScopedVisitor, traces.MatchAstVisitor):
   def process_import(self, node):
     """Common code for Import and ImportFrom."""
 
-    for alias, (loc, (op, symbol, data)) in zip(node.names, self.match(node)):
+    for alias, (loc, trace) in zip(node.names, self.match(node)):
       # If an import is aliased, match() returns only the symbol/loc of
       # the alias, whereas the indexer also needs access to the unaliased
       # name in order to reference the imported module.
+      op = trace.op
+      symbol = trace.symbol
+      data = trace.types
       defn = None  # type: Optional[Definition]
       if alias.asname:
         defn = self.add_local_def(
@@ -921,6 +961,7 @@ class Indexer:
     self.links = []
     self.function_params = None
     self.function_map = None
+    self.childof = []
 
     # Optionally preserve the pytype vm so we can access the types later
     self.vm = None
@@ -940,10 +981,12 @@ class Indexer:
     self.classmap = v.classmap
     self.calls = v.calls
     self.function_params = v.function_params
+    self.childof = v.childof
 
   def get_def_offsets(self, defloc):
     """Get the byte offsets for a definition."""
 
+    assert self.defs is not None
     defn = self.defs[defloc.def_id]
     typ = defn.typ
     if typ == "Attribute":
@@ -986,6 +1029,7 @@ class Indexer:
 
   def _lookup_remote_symbol(self, defn, attr_name):
     """Try to look up a definition in an imported module."""
+    assert self.modules is not None
     if defn.id in self.modules:
       return Remote(self.modules[defn.id], name=attr_name, resolved=True)
 
@@ -1010,6 +1054,7 @@ class Indexer:
   def _lookup_class_attr(self, name, attrib):
     """Look up a class attribute in the environment."""
 
+    assert self.envs is not None
     env = self.envs["module"]
     if name not in env.env:
       return None
@@ -1024,6 +1069,7 @@ class Indexer:
     if isinstance(obj, abstract.Module):
       return Module(obj.name)
     elif isinstance(obj, abstract.InterpreterClass):
+      assert self.classmap is not None
       return self.classmap.get(obj)
     elif isinstance(obj, abstract.PyTDClass):
       if obj.module:
@@ -1051,8 +1097,17 @@ class Indexer:
   def _lookup_attribute_by_type(self, r, attr_name):
     """Look up an attribute using pytype annotations."""
 
-    lhs, rhs = r.data
     links = []
+    # For unclear reasons, we sometimes do not get two elements in r.data
+    # See b/233390756 for an example. This handles the error gracefully, since
+    # rhs is not used in most of this function.
+    if not r.data:
+      return []
+    elif len(r.data) == 1:
+      lhs, rhs = r.data[0], None
+    else:
+      lhs, rhs = r.data
+
     for l in lhs:
       if self._is_pytype_module(l):
         lookup = [l]
@@ -1062,6 +1117,7 @@ class Indexer:
         cls = self._get_attribute_class(pytype_cls)
         if cls:
           if isinstance(cls, Definition):
+            assert self.envs is not None
             env = self.envs[cls.id]
             _, attr_value = env.lookup(attr_name)
             if not attr_value and isinstance(l, abstract.Instance):
@@ -1092,6 +1148,7 @@ class Indexer:
 
     links = []
 
+    assert self.refs is not None
     for r in self.refs:
       if r.typ == "Attribute":
         attr_name = r.name.rsplit(".", 1)[-1]
@@ -1100,6 +1157,7 @@ class Indexer:
           links.extend(defs)
           continue
         else:
+          assert self.envs is not None
           env = self.envs[r.scope]
           env, defn = env.lookup(r.target)
           if defn:
@@ -1144,6 +1202,7 @@ class Indexer:
         links.append((r, Remote(module, name=name, resolved=True)))
       else:
         try:
+          assert self.envs is not None
           env, defn = self.envs[r.scope].lookup(r.name)
         except KeyError:
           env, defn = None, None
@@ -1176,12 +1235,14 @@ class Indexer:
       r.target = None
       r.data = None
 
+    assert self.defs is not None
     for d in self.defs.values():
       d.data = None
 
     for call in self.calls:
       call.return_type = None
 
+    assert self.aliases is not None
     for a in self.aliases.values():
       a.data = None
 
@@ -1217,7 +1278,7 @@ class VmTrace(source.AbstractTrace):
     types_repr = tuple(
         t and [node_utils.typename(x) for x in t]
         for t in self.types)
-    return "%s %s" % (super().__repr__(), types_repr)
+    return f"{super().__repr__()} {types_repr}"
 
 
 def process_file(options, source_text=None, generate_callgraphs=False,

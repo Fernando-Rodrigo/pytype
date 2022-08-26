@@ -12,13 +12,14 @@ filegroup(
     builtins/attr/filters.pytd
     builtins/attr/setters.pytd
     builtins/attr/validators.pytd
+    builtins/attrs/__init__.pytd
     builtins/builtins.pytd
     builtins/mypy_extensions.pytd
     builtins/numpy/__init__.pytd
     builtins/protocols.pytd
     builtins/typing.pytd
     stdlib/_ctypes.pytd
-    stdlib/collections.pytd
+    stdlib/collections/__init__.pytd
     stdlib/dummy_thread.pytd
     stdlib/encodings.pytd
     stdlib/enum.pytd

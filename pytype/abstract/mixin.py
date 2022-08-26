@@ -5,6 +5,8 @@ from typing import Any, Dict, Type
 
 from pytype.abstract import abstract_utils
 from pytype.abstract import function
+from pytype.pytd import pytd
+from pytype.pytd import pytd_utils
 from pytype.typegraph import cfg
 
 log = logging.getLogger(__name__)
@@ -18,7 +20,7 @@ class MixinMeta(type):
   _HAS_DYNAMIC_ATTRIBUTES = True
 
   def __init__(cls, name, superclasses, *args, **kwargs):
-    super(MixinMeta, cls).__init__(name, superclasses, *args, **kwargs)
+    super().__init__(name, superclasses, *args, **kwargs)
     for sup in superclasses:
       if hasattr(sup, "overloads"):
         for method in sup.overloads:
@@ -97,7 +99,7 @@ class PythonConstant(metaclass=MixinMeta):
       self._printing = True
       const = self.str_of_constant(str)
       self._printing = False
-    return "<%s %r>" % (self.name, const)
+    return f"<{self.name} {const!r}>"
 
 
 class HasSlots(metaclass=MixinMeta):
@@ -122,7 +124,7 @@ class HasSlots(metaclass=MixinMeta):
 
   def set_slot(self, name, method):
     """Add a new slot to this value."""
-    assert name not in self._slots, "slot %s already occupied" % name
+    assert name not in self._slots, f"slot {name} already occupied"
     # For getting a slot value, we don't need a ParameterizedClass's type
     # parameters, and evaluating them in the middle of constructing the class
     # can trigger a recursion error, so use only the base class.
@@ -221,10 +223,18 @@ class LazyMembers(metaclass=MixinMeta):
 
   def load_lazy_attribute(self, name, subst=None):
     """Load the named attribute into self.members."""
-    if name not in self.members and name in self._member_map:
-      variable = self._convert_member(name, self._member_map[name], subst)
-      assert isinstance(variable, cfg.Variable)
+    if name in self.members or name not in self._member_map:
+      return self.members.get(name)
+    member = self._member_map[name]
+    variable = self._convert_member(name, member, subst)
+    assert isinstance(variable, cfg.Variable)
+    # 'subst' can vary between attribute accesses, so it's not safe to store the
+    # attribute value in 'members' if it uses any of the subst keys.
+    if not (isinstance(member, pytd.Node) and subst and
+            any(t.full_name in subst
+                for t in pytd_utils.GetTypeParameters(member))):
       self.members[name] = variable
+    return variable
 
 
 class PythonDict(PythonConstant):

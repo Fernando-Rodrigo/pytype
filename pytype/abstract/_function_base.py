@@ -13,7 +13,6 @@ from pytype.abstract import _instances
 from pytype.abstract import _singletons
 from pytype.abstract import _typing
 from pytype.abstract import abstract_utils
-from pytype.abstract import class_mixin
 from pytype.abstract import function
 
 log = logging.getLogger(__name__)
@@ -70,6 +69,59 @@ class Function(_instance_base.SimpleValue):
         name = self._get_cell_variable_name(a)
         assert name is not None, "Closure variable lookup failed."
         raise function.UndefinedParameterError(name)
+    # The implementation of match_args is currently rather convoluted because we
+    # have two different implementations:
+    # * Old implementation: `_match_views` matches 'args' against 'self' one
+    #   view at a time, where a view is a mapping of every variable in args to a
+    #   particular binding. This handles complex generics but scales poorly with
+    #   the number of bindings per variable.
+    # * New implementation: `_match_args_sequentially` matches 'args' one at a
+    #   time. This scales better but cannot yet handle complex generics.
+    # Subclasses should implement the following:
+    # * _match_view(node, args, view, alias_map): this will be called repeatedly
+    #   by _match_views.
+    # * _match_args_sequentially(node, args, alias_map, match_all_views): A
+    #   sequential matching implementation.
+    # TODO(b/228241343): Get rid of _match_views and simplify match_args once
+    # _match_args_sequentially can handle all generics.
+    if self._is_complex_generic_call(args):
+      return self._match_views(node, args, alias_map, match_all_views)
+    return self._match_args_sequentially(node, args, alias_map, match_all_views)
+
+  def _is_complex_generic_call(self, args):
+    signatures = function.get_signatures(self)
+    # pytype: disable=attribute-error
+    if _isinstance(self, "SignedFunction") and self.signature not in signatures:
+      # This happens for overloads. While overloads are not callable, we do call
+      # match_args on them to catch bad defaults.
+      signatures.append(self.signature)
+    # pytype: enable=attribute-error
+    for sig in signatures:
+      parameter_typevar_count = 0
+      for name, t in sig.annotations.items():
+        stack = [t]
+        seen = set()
+        while stack:
+          cur = stack.pop()
+          if cur in seen:
+            continue
+          seen.add(cur)
+          if cur.template:
+            return True
+          parameter_typevar_count += (name != "return" and cur.formal)
+          if _isinstance(cur, "Union"):
+            stack.extend(cur.options)
+      if parameter_typevar_count > 1:
+        return True
+    if self.is_attribute_of_class and args.posargs:
+      for self_val in args.posargs[0].data:
+        for cls in self_val.cls.mro:
+          if cls.template:
+            return True
+    return False
+
+  def _match_views(self, node, args, alias_map, match_all_views):
+    """Matches all views of the given args against this function."""
     error = None
     matched = []
     arg_variables = args.get_variables()
@@ -92,7 +144,7 @@ class Function(_instance_base.SimpleValue):
         else:
           # Add the name of the caller if possible.
           if hasattr(self, "parent"):
-            e.name = "%s.%s" % (self.parent.name, e.name)
+            e.name = f"{self.parent.name}.{e.name}"
           if match_all_views or self.ctx.options.strict_parameter_checks:
             raise e
           error = e
@@ -105,6 +157,9 @@ class Function(_instance_base.SimpleValue):
     return matched
 
   def _match_view(self, node, args, view, alias_map):
+    raise NotImplementedError(self.__class__.__name__)
+
+  def _match_args_sequentially(self, node, args, alias_map, match_all_views):
     raise NotImplementedError(self.__class__.__name__)
 
   def __repr__(self):
@@ -230,42 +285,14 @@ class BoundFunction(_base.BaseValue):
     self.replace_self_annot = None
     inst = abstract_utils.get_atomic_value(
         self._callself, default=self.ctx.convert.unsolvable)
-    if self._should_replace_self_annot():
-      if (isinstance(inst.cls, class_mixin.Class) and
-          inst.cls.full_name != "builtins.type"):
-        for cls in inst.cls.mro:
-          if isinstance(cls, _classes.ParameterizedClass):
-            base_cls = cls.base_cls
-          else:
-            base_cls = cls
-          if isinstance(base_cls, class_mixin.Class) and base_cls.template:
-            self.replace_self_annot = (
-                _classes.ParameterizedClass.get_generic_instance_type(base_cls))
-            break
+    if self.underlying.should_replace_self_annot():
+      self.replace_self_annot = abstract_utils.get_generic_type(inst)
     if isinstance(inst, _instance_base.SimpleValue):
       self.alias_map = inst.instance_type_parameters.uf
     elif isinstance(inst, _typing.TypeParameterInstance):
       self.alias_map = inst.instance.instance_type_parameters.uf
     else:
       self.alias_map = None
-
-  def _should_replace_self_annot(self):
-    # To do argument matching for custom generic classes, the 'self' annotation
-    # needs to be replaced with a generic type.
-    f = self.underlying
-    if not _isinstance(f, "SignedFunction") or not f.signature.param_names:
-      # no 'self' to replace
-      return False
-    if _isinstance(f, "InterpreterFunction"):
-      # always replace for user-defined methods
-      return True
-    # SimpleFunctions are methods we construct internally for generated classes
-    # like namedtuples.
-    if not _isinstance(f, "SimpleFunction"):
-      return False
-    # We don't want to clobber our own generic annotations.
-    return (f.signature.param_names[0] not in f.signature.annotations or
-            not f.signature.annotations[f.signature.param_names[0]].formal)
 
   def argcount(self, node):
     return self.underlying.argcount(node) - 1  # account for self
@@ -299,7 +326,7 @@ class BoundFunction(_base.BaseValue):
           # match_args will try to prepend the parent's name to the error name.
           # Overwrite it with _callself instead, which may be more exact.
           _, _, e.name = e.name.rpartition(".")
-        e.name = "%s.%s" % (self._callself.data[0].name, e.name)
+        e.name = f"{self._callself.data[0].name}.{e.name}"
       raise
     finally:
       if abstract_utils.func_name_is_class_init(self.name):
@@ -460,4 +487,4 @@ class Splat(_base.BaseValue):
     self.iterable = iterable
 
   def __repr__(self):
-    return "splat(%r)" % self.iterable.data
+    return f"splat({self.iterable.data!r})"

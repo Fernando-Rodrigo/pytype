@@ -3,7 +3,6 @@
 import textwrap
 
 from pytype import config
-from pytype import file_utils
 from pytype.abstract import abstract
 from pytype.abstract import abstract_utils
 from pytype.tests import test_base
@@ -44,7 +43,7 @@ class MatcherTest(MatcherTestBase):
   def _parse_and_lookup(self, src, objname, filename=None):
     if filename is None:
       filename = str(hash(src))
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file(filename + ".pyi", src)
       self.ctx.options.tweak(pythonpath=[d.path])  # monkeypatch
       ast = self.ctx.loader.import_name(filename)
@@ -508,14 +507,14 @@ class TypeVarTest(MatcherTestBase):
         self.matcher.bad_matches(
             abstract.TypeParameter("T",
                                    self.ctx).to_variable(self.ctx.root_node),
-            self.ctx.convert.unsolvable))
+            self.ctx.convert.unsolvable)[0])
 
   def test_bad_matches_no_match(self):
     self.assertTrue(
         self.matcher.bad_matches(
             abstract.TypeParameter("T",
                                    self.ctx).to_variable(self.ctx.root_node),
-            self.ctx.convert.int_type))
+            self.ctx.convert.int_type)[0])
 
   def test_any(self):
     self.assertMatch(

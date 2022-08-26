@@ -35,7 +35,6 @@ py_library(
     .convert
     .convert_structural
     .debug
-    .directors
     .errors
     .imports_map_loader
     .io
@@ -47,6 +46,7 @@ py_library(
     .state
     .tracer_vm
     .vm
+    pytype.directors.directors
 )
 
 py_library(
@@ -73,6 +73,7 @@ py_library(
     .errors
     .metrics
     pytype.abstract.abstract
+    pytype.inspect.inspect
     pytype.pytd.pytd
 )
 
@@ -83,9 +84,11 @@ py_library(
     annotation_utils.py
   DEPS
     ._utils
+    .state
     pytype.abstract.abstract
     pytype.overlays.overlays
     pytype.pytd.pytd
+    pytype.typegraph.cfg
 )
 
 py_library(
@@ -95,6 +98,7 @@ py_library(
     attribute.py
   DEPS
     ._utils
+    .datatypes
     .special_builtins
     pytype.abstract.abstract
     pytype.overlays.overlays
@@ -130,9 +134,10 @@ py_library(
     ._utils
     .datatypes
     .errors
+    .file_utils
     .imports_map_loader
     .module_utils
-    pytype.pytd.pytd
+    pytype.pyc.pyc
     pytype.typegraph.cfg_utils
 )
 
@@ -214,16 +219,6 @@ py_library(
 
 py_library(
   NAME
-    directors
-  SRCS
-    directors.py
-  DEPS
-    ._utils
-    .blocks
-)
-
-py_library(
-  NAME
     errors
   SRCS
     errors.py
@@ -241,6 +236,8 @@ py_library(
     file_utils
   SRCS
     file_utils.py
+  DEPS
+    pytype.platform_utils.platform_utils
 )
 
 py_library(
@@ -248,6 +245,8 @@ py_library(
     imports_map_loader
   SRCS
     imports_map_loader.py
+  DEPS
+    pytype.platform_utils.platform_utils
 )
 
 py_library(
@@ -261,9 +260,10 @@ py_library(
     .analyze
     .config
     .constant_folding
-    .directors
     .errors
     .load_pytd
+    pytype.directors.directors
+    pytype.imports.imports
     pytype.pyc.pyc
     pytype.pyi.parser
     pytype.pytd.pytd
@@ -276,7 +276,10 @@ py_library(
     load_pytd.py
   DEPS
     ._utils
+    .file_utils
     .module_utils
+    pytype.imports.imports
+    pytype.platform_utils.platform_utils
     pytype.pyi.parser
     pytype.pytd.pytd
 )
@@ -293,6 +296,7 @@ py_library(
     pytype.abstract.abstract
     pytype.overlays.overlays
     pytype.pytd.pytd
+    pytype.typegraph.cfg
 )
 
 py_library(
@@ -316,6 +320,8 @@ py_library(
     module_utils
   SRCS
     module_utils.py
+  DEPS
+    pytype.platform_utils.platform_utils
 )
 
 py_library(
@@ -344,10 +350,18 @@ py_library(
 
 py_library(
   NAME
+    preprocess
+  SRCS
+    preprocess.py
+)
+
+py_library(
+  NAME
     pytype_source_utils
   SRCS
     pytype_source_utils.py
   DEPS
+    pytype.platform_utils.platform_utils
     pytype.stubs.stubs
 )
 
@@ -367,6 +381,7 @@ py_library(
     state.py
   DEPS
     ._utils
+    .blocks
     .compare
     .metrics
     pytype.abstract.abstract
@@ -395,6 +410,7 @@ py_library(
     utils.py
   DEPS
     .pytype_source_utils
+    pytype.platform_utils.platform_utils
 )
 
 py_library(
@@ -415,12 +431,13 @@ py_library(
     .compare
     .constant_folding
     .datatypes
-    .directors
     .load_pytd
     .metrics
+    .preprocess
     .state
     .vm_utils
     pytype.abstract.abstract
+    pytype.directors.directors
     pytype.overlays.overlays
     pytype.pyc.pyc
     pytype.pyi.parser
@@ -441,6 +458,7 @@ py_library(
     .overriding_checks
     .state
     pytype.abstract.abstract
+    pytype.platform_utils.platform_utils
     pytype.pyc.pyc
     pytype.pytd.pytd
     pytype.typegraph.cfg
@@ -487,6 +505,7 @@ py_test(
   DEPS
     .config
     .io
+    pytype.platform_utils.platform_utils
     pytype.pytd.pytd
 )
 
@@ -497,6 +516,8 @@ py_test(
     file_utils_test.py
   DEPS
     .file_utils
+    pytype.platform_utils.platform_utils
+    pytype.tests.test_base
 )
 
 py_test(
@@ -507,6 +528,7 @@ py_test(
   DEPS
     .file_utils
     .module_utils
+    pytype.platform_utils.platform_utils
 )
 
 py_test(
@@ -516,6 +538,7 @@ py_test(
     pytype_source_utils_test.py
   DEPS
     .pytype_source_utils
+    pytype.platform_utils.platform_utils
 )
 
 py_test(
@@ -550,10 +573,6 @@ py_test(
     matcher_test.py
   DEPS
     .config
-    .context
-    .errors
-    .file_utils
-    .load_pytd
     pytype.abstract.abstract
     pytype.tests.test_base
 )
@@ -565,10 +584,6 @@ py_test(
     convert_test.py
   DEPS
     .config
-    .context
-    .errors
-    .file_utils
-    .load_pytd
     pytype.abstract.abstract
     pytype.pytd.pytd
     pytype.tests.test_base
@@ -624,25 +639,9 @@ py_test(
   SRCS
     vm_test.py
   DEPS
-    ._utils
-    .blocks
     .context
-    .errors
     .vm
-    pytype.pyc.pyc
     pytype.tests.test_base
-)
-
-py_test(
-  NAME
-    directors_test
-  SRCS
-    directors_test.py
-  DEPS
-    .blocks
-    .directors
-    .errors
-    pytype.pyc.pyc
 )
 
 py_test(
@@ -655,6 +654,8 @@ py_test(
     .file_utils
     .load_pytd
     .module_utils
+    pytype.imports.imports
+    pytype.platform_utils.platform_utils
     pytype.pytd.pytd
     pytype.stubs.stubs
     pytype.tests.test_base
@@ -668,7 +669,9 @@ py_test(
   DEPS
     .file_utils
     .imports_map_loader
+    pytype.platform_utils.platform_utils
     pytype.stubs.stubs
+    pytype.tests.test_base
 )
 
 py_test(
@@ -678,6 +681,7 @@ py_test(
     metrics_test.py
   DEPS
     .metrics
+    pytype.platform_utils.platform_utils
 )
 
 py_test(
@@ -710,13 +714,18 @@ py_library(
     .io
     .load_pytd
     .metrics
+    pytype.imports.imports
     pytype.pytd.pytd
     pytype.pytd.parse.parse
 )
 
 add_subdirectory(abstract)
 add_subdirectory(ast)
+add_subdirectory(directors)
+add_subdirectory(imports)
+add_subdirectory(inspect)
 add_subdirectory(overlays)
+add_subdirectory(platform_utils)
 add_subdirectory(pyc)
 add_subdirectory(pyi)
 add_subdirectory(pytd)

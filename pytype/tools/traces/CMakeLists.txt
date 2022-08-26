@@ -40,7 +40,6 @@ py_test(
   DEPS
     ._traces
     pytype.libvm
-    pytype.utils
     pytype.pytd.pytd
     pytype.tests.test_base
 )
@@ -51,7 +50,7 @@ py_library(
   SRCS
     source.py
   DEPS
-    pytype.utils
+    pytype.pytd.pytd
 )
 
 py_test(

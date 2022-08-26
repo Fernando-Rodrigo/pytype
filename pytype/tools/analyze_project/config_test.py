@@ -5,18 +5,21 @@ import sys
 import types
 
 from pytype import file_utils
+from pytype.platform_utils import path_utils
+from pytype.tests import test_utils
 from pytype.tools.analyze_project import config
 from pytype.tools.analyze_project import parse_args
+
 import unittest
 
 
-PYTYPE_CFG = """
+PYTYPE_CFG = f"""
   [pytype]
   exclude = nonexistent.*
   pythonpath =
-    .:
-    /foo/bar:
-    baz/quux
+    .{os.pathsep}
+    {'C:' if sys.platform == 'win32' else ''}{os.path.sep}foo{os.path.sep}bar{os.pathsep}
+    baz{os.path.sep}quux
   python_version = 3.7
   disable =
     import-error
@@ -41,8 +44,9 @@ class TestBase(unittest.TestCase):
     self.assertFalse(hasattr(conf, 'output'))
     self.assertEqual(conf.pythonpath, [
         path,
-        '/foo/bar',
-        os.path.join(path, 'baz/quux')
+        (('C:' if sys.platform == 'win32' else '') +
+         file_utils.replace_separator('/foo/bar')),
+        path_utils.join(path, file_utils.replace_separator('baz/quux'))
     ])
     self.assertEqual(conf.python_version, '3.7')
     self.assertEqual(conf.disable, 'import-error,module-attr')
@@ -56,7 +60,7 @@ class TestFileConfig(TestBase):
   """Test FileConfig."""
 
   def test_config_file(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       f = d.create_file('test.cfg', PYTYPE_CFG)
       conf = config.FileConfig()
       path = conf.read_from_file(f)
@@ -64,7 +68,7 @@ class TestFileConfig(TestBase):
       self._validate_file_contents(conf, d.path)
 
   def test_missing_config_file_section(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       f = d.create_file('test.cfg', RANDOM_CFG)
       conf = config.FileConfig()
       path = conf.read_from_file(f)
@@ -73,12 +77,14 @@ class TestFileConfig(TestBase):
 
   def test_read_nonexistent(self):
     conf = config.FileConfig()
-    self.assertIsNone(conf.read_from_file('/does/not/exist/test.cfg'))
+    self.assertIsNone(
+        conf.read_from_file(
+            file_utils.replace_separator('/does/not/exist/test.cfg')))
     self._validate_empty_contents(conf)
 
   def test_read_bad_format(self):
     conf = config.FileConfig()
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       f = d.create_file('test.cfg', 'ladadeda := squirrels')
       self.assertIsNone(conf.read_from_file(f))
     self._validate_empty_contents(conf)
@@ -118,32 +124,34 @@ class TestGenerateConfig(unittest.TestCase):
 
   @classmethod
   def setUpClass(cls):
-    super(TestGenerateConfig, cls).setUpClass()
+    super().setUpClass()
     cls.parser = parse_args.make_parser()
 
   def test_bad_location(self):
     with self.assertRaises(SystemExit):
-      config.generate_sample_config_or_die('/does/not/exist/sample.cfg',
-                                           self.parser.pytype_single_args)
+      config.generate_sample_config_or_die(
+          file_utils.replace_separator('/does/not/exist/sample.cfg'),
+          self.parser.pytype_single_args)
 
   def test_existing_file(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       f = d.create_file('sample.cfg')
       with self.assertRaises(SystemExit):
         config.generate_sample_config_or_die(f, self.parser.pytype_single_args)
 
   def test_generate(self):
     conf = config.FileConfig()
-    with file_utils.Tempdir() as d:
-      f = os.path.join(d.path, 'sample.cfg')
+    with test_utils.Tempdir() as d:
+      f = path_utils.join(d.path, 'sample.cfg')
       config.generate_sample_config_or_die(f, self.parser.pytype_single_args)
       # Test that we've generated a valid config and spot-check a pytype-all
       # and a pytype-single argument.
       conf.read_from_file(f)
       with file_utils.cd(d.path):
         expected_pythonpath = [
-            os.path.realpath(p)
-            for p in config.ITEMS['pythonpath'].sample.split(os.pathsep)]
+            path_utils.realpath(p)
+            for p in config.ITEMS['pythonpath'].sample.split(os.pathsep)
+        ]
       expected_protocols = config._PYTYPE_SINGLE_ITEMS['protocols'].sample
       self.assertEqual(conf.pythonpath, expected_pythonpath)
       self.assertEqual(conf.protocols, expected_protocols)
@@ -151,8 +159,8 @@ class TestGenerateConfig(unittest.TestCase):
                        '{}.{}'.format(*sys.version_info[:2]))
 
   def test_read(self):
-    with file_utils.Tempdir() as d:
-      f = os.path.join(d.path, 'test.cfg')
+    with test_utils.Tempdir() as d:
+      f = path_utils.join(d.path, 'test.cfg')
       config.generate_sample_config_or_die(f, self.parser.pytype_single_args)
       conf = config.read_config_file_or_die(f)
     # Smoke test for postprocessing and spot-check of a result.
@@ -161,8 +169,8 @@ class TestGenerateConfig(unittest.TestCase):
 
   def test_keep_going_file_default(self):
     conf = config.FileConfig()
-    with file_utils.Tempdir() as d:
-      f = os.path.join(d.path, 'sample.cfg')
+    with test_utils.Tempdir() as d:
+      f = path_utils.join(d.path, 'sample.cfg')
       config.generate_sample_config_or_die(f, self.parser.pytype_single_args)
       conf.read_from_file(f)
     self.assertIsInstance(conf.keep_going, bool)
@@ -172,35 +180,35 @@ class TestReadConfig(TestBase):
   """Test config.read_config_file_or_die()."""
 
   def test_config_file(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       f = d.create_file('test.cfg', PYTYPE_CFG)
       conf = config.read_config_file_or_die(f)
       self._validate_file_contents(conf, d.path)
 
   def test_missing_config_file_section(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       f = d.create_file('test.cfg', RANDOM_CFG)
       with self.assertRaises(SystemExit):
         config.read_config_file_or_die(f)
 
   def test_setup_cfg(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file('setup.cfg', SETUP_CFG)
       with file_utils.cd(d.path):
         conf = config.read_config_file_or_die(None)
         self._validate_file_contents(conf, d.path)
 
   def test_setup_cfg_from_subdir(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file('setup.cfg', SETUP_CFG)
-      sub = d.create_directory('x/y/z')
+      sub = d.create_directory(file_utils.replace_separator('x/y/z'))
       conf = config.Config()
       with file_utils.cd(sub):
         conf = config.read_config_file_or_die(None)
         self._validate_file_contents(conf, d.path)
 
   def test_missing_setup_cfg_section(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file('setup.cfg', RANDOM_CFG)
       with file_utils.cd(d.path):
         conf = config.read_config_file_or_die(None)

@@ -38,8 +38,8 @@ class BaseValue(utils.ContextWeakrefMixin):
     self.cls = self
     self.name = name
     self.mro = self.compute_mro()
-    self.module = None
-    self.official_name = None
+    self._module = None
+    self._official_name = None
     self.slots = None  # writable attributes (or None if everything is writable)
     # true for functions and classes that have decorators applied to them.
     self.is_decorated = False
@@ -57,6 +57,23 @@ class BaseValue(utils.ContextWeakrefMixin):
     #   x: str = "hello"
     # would create an instance of str with from_annotation = 'x'
     self.from_annotation = None
+
+  @property
+  def module(self):
+    return self._module
+
+  @module.setter
+  def module(self, module):
+    self._module = module
+    self.update_official_name(self.name)
+
+  @property
+  def official_name(self):
+    return self._official_name
+
+  @official_name.setter
+  def official_name(self, official_name):
+    self._official_name = official_name
 
   @property
   def all_template_names(self):
@@ -362,6 +379,30 @@ class BaseValue(utils.ContextWeakrefMixin):
   def is_late_annotation(self):
     return False
 
+  def should_replace_self_annot(self):
+    # To do argument matching for custom generic classes, the 'self' annotation
+    # needs to be replaced with a generic type.
+
+    # We need to disable attribute-error because pytype doesn't understand our
+    # special _isinstance function.
+    # pytype: disable=attribute-error
+    if (not _isinstance(self, "SignedFunction") or
+        not self.signature.param_names):
+      # no 'self' to replace
+      return False
+    if _isinstance(self, "InterpreterFunction"):
+      # always replace for user-defined methods
+      return True
+    # SimpleFunctions are methods we construct internally for generated classes
+    # like namedtuples.
+    if not _isinstance(self, "SimpleFunction"):
+      return False
+    # We don't want to clobber our own generic annotations.
+    return (
+        self.signature.param_names[0] not in self.signature.annotations or
+        not self.signature.annotations[self.signature.param_names[0]].formal)
+    # pytype: enable=attribute-error
+
 
 def _get_template(val: Any):
   """Get the value's class template."""
@@ -456,6 +497,6 @@ def _compute_template(val: Any):
       template.extend(mro.MergeSequences(seqs))
     except ValueError as e:
       raise abstract_utils.GenericTypeError(
-          val, "Illegal type parameter order in class %s" % val.name) from e
+          val, f"Illegal type parameter order in class {val.name}") from e
 
   return template

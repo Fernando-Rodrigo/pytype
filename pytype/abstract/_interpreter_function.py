@@ -6,6 +6,7 @@ import hashlib
 import itertools
 import logging
 
+from pytype import datatypes
 from pytype.abstract import _classes
 from pytype.abstract import _function_base
 from pytype.abstract import _instance_base
@@ -172,7 +173,8 @@ class SignedFunction(_function_base.Function):
     kwnames = set(kws)
     extra_kws = kwnames.difference(sig.param_names + sig.kwonly_params)
     if extra_kws and not sig.kwargs_name:
-      raise function.WrongKeywordArgs(sig, args, self.ctx, extra_kws)
+      if function.has_visible_namedarg(node, args, extra_kws):
+        raise function.WrongKeywordArgs(sig, args, self.ctx, extra_kws)
     posonly_kws = kwnames & posonly_names
     # If a function has a **kwargs parameter, then keyword arguments with the
     # same name as a positional-only argument are allowed, e.g.:
@@ -233,6 +235,26 @@ class SignedFunction(_function_base.Function):
       raise function.WrongArgTypes(
           self.signature, args, self.ctx, bad_param=bad_arg)
     return subst
+
+  def _match_args_sequentially(self, node, args, alias_map, match_all_views):
+    substs = None
+    for name, arg, formal in self.signature.iter_args(args):
+      if formal is None:
+        continue
+      if name in (self.signature.varargs_name, self.signature.kwargs_name):
+        # The annotation is Tuple or Dict, but the passed arg only has to be
+        # Iterable or Mapping.
+        formal = self.ctx.convert.widen_type(formal)
+      match_result = self.ctx.matcher(node).bad_matches(arg, formal, name)
+      if not function.match_succeeded(match_result, match_all_views, self.ctx):
+        raise function.WrongArgTypes(self.signature, args, self.ctx,
+                                     bad_param=match_result[0][0].expected)
+      if any(match_result[1]):
+        assert substs is None
+        substs = match_result[1]
+    if not substs:
+      substs = [datatypes.HashableDict()]
+    return substs
 
   def get_first_opcode(self):
     return None
@@ -625,7 +647,12 @@ class InterpreterFunction(SignedFunction):
         not abstract_utils.func_name_is_class_init(self.name)):
       log.info("Maximum depth reached. Not analyzing %r", self.name)
       self._set_callself_maybe_missing_members()
-      return node, self.ctx.new_unsolvable(node)
+      if self.signature.annotations.get("return") == self.ctx.convert.no_return:
+        # TODO(b/147230757): Use all return annotations, not just NoReturn.
+        ret = self.signature.annotations["return"]
+      else:
+        ret = self.ctx.convert.unsolvable
+      return node, ret.to_variable(node)
     args = self._fix_args_for_unannotated_contextmanager_exit(node, func, args)
     args = args.simplify(node, self.ctx, self.signature)
     sig, substs, callargs = self._find_matching_sig(node, args, alias_map)

@@ -1,25 +1,17 @@
 """Config file processing."""
 
-import collections
+import dataclasses
 import logging
 import os
 import sys
 import textwrap
+from typing import Any, Callable, Optional
 
 from pytype import config as pytype_config
 from pytype import file_utils
 from pytype import utils
+from pytype.platform_utils import path_utils
 from pytype.tools import config
-
-
-# A config item.
-# Args:
-#   default: the default value.
-#   sample: a sample value.
-#   arg_info: information about the corresponding command-line argument.
-#   comment: help text.
-Item = collections.namedtuple(
-    'Item', ['default', 'sample', 'arg_info', 'comment'])
 
 
 # Args:
@@ -30,7 +22,24 @@ Item = collections.namedtuple(
 #     - If a bool, it will determine whether the flag is included.
 #     - Elif it is empty, the flag will be omitted.
 #     - Else, it will be considered the flag's command-line value.
-ArgInfo = collections.namedtuple('ArgInfo', ['flag', 'to_command_line'])
+@dataclasses.dataclass(eq=True, frozen=True)
+class ArgInfo:
+  flag: str
+  to_command_line: Optional[Callable[[Any], Any]]
+
+
+# A config item.
+# Args:
+#   default: the default value.
+#   sample: a sample value.
+#   arg_info: information about the corresponding command-line argument.
+#   comment: help text.
+@dataclasses.dataclass(eq=True, frozen=True)
+class Item:
+  default: Any
+  sample: Any
+  arg_info: Optional[ArgInfo]
+  comment: Optional[str]
 
 
 # Generates both the default config and the sample config file. These items
@@ -56,7 +65,7 @@ ITEMS = {
         'Platform (e.g., "linux", "win32") that the target code runs on.'),
     'pythonpath': Item(
         '', '.', None,
-        'Paths to source code directories, separated by %r.' % os.pathsep),
+        f'Paths to source code directories, separated by {os.pathsep!r}.'),
     'python_version': Item(
         '', '{}.{}'.format(*sys.version_info[:2]),
         None, 'Python version (major.minor) of the target code.'),
@@ -111,17 +120,30 @@ def get_python_version(v):
   return v or utils.format_version(sys.version_info[:2])
 
 
+def parse_jobs(s):
+  """Parse the --jobs option."""
+  if s == 'auto':
+    try:
+      n = len(os.sched_getaffinity(0))  # pytype: disable=module-attr
+    except AttributeError:
+      n = os.cpu_count()
+    return n or 1
+  else:
+    return int(s)
+
+
 def make_converters(cwd=None):
   """For items that need coaxing into their internal representations."""
   return {
+      'disable': concat_disabled_rules,
       'exclude': lambda v: file_utils.expand_source_files(v, cwd),
-      'keep_going': string_to_bool,
       'inputs': lambda v: file_utils.expand_source_files(v, cwd),
+      'jobs': parse_jobs,
+      'keep_going': string_to_bool,
       'output': lambda v: file_utils.expand_path(v, cwd),
       'platform': get_platform,
       'python_version': get_python_version,
       'pythonpath': lambda v: file_utils.expand_pythonpath(v, cwd),
-      'disable': concat_disabled_rules,
   }
 
 
@@ -129,8 +151,8 @@ def _make_spaced_path_formatter(name):
   """Formatter for space-separated paths."""
   def format_spaced_path(p):
     out = []
-    out.append('%s =' % name)
-    out.extend('    %s' % entry for entry in p.split())
+    out.append(f'{name} =')
+    out.extend(f'    {entry}' for entry in p.split())
     return out
   return format_spaced_path
 
@@ -139,10 +161,10 @@ def _make_separated_path_formatter(name, sep):
   """Formatter for paths separated by a non-space token."""
   def format_separated_path(p):
     out = []
-    out.append('%s =' % name)
+    out.append(f'{name} =')
     # Breaks the path after each instance of sep.
     for entry in p.replace(sep, sep + '\n').split('\n'):
-      out.append('    %s' % entry)
+      out.append(f'    {entry}')
     return out
   return format_separated_path
 
@@ -178,7 +200,7 @@ def Config(*extra_variables):  # pylint: disable=invalid-name
 
     def __str__(self):
       return '\n'.join(
-          '%s = %r' % (k, getattr(self, k, None)) for k in self.__slots__)
+          f'{k} = {getattr(self, k, None)!r}' for k in self.__slots__)
 
   return Config()
 
@@ -192,7 +214,7 @@ class FileConfig:
     cfg = config.ConfigSection.create_from_file(filepath, 'pytype')
     if not cfg:
       return None
-    converters = make_converters(cwd=os.path.dirname(filepath))
+    converters = make_converters(cwd=path_utils.dirname(filepath))
     for k, v in cfg.items():
       if k in converters:
         v = converters[k](v)
@@ -203,7 +225,7 @@ class FileConfig:
 def generate_sample_config_or_die(filename, pytype_single_args):
   """Write out a sample config file."""
 
-  if os.path.exists(filename):
+  if path_utils.exists(filename):
     logging.critical('Not overwriting existing file: %s', filename)
     sys.exit(1)
 
@@ -211,11 +233,12 @@ def generate_sample_config_or_die(filename, pytype_single_args):
   items = dict(ITEMS)
   assert set(_PYTYPE_SINGLE_ITEMS) == set(pytype_single_args)
   for key, item in _PYTYPE_SINGLE_ITEMS.items():
+    val = pytype_single_args[key]
     if item.comment is None:
-      items[key] = item._replace(default=pytype_single_args[key].default,
-                                 comment=pytype_single_args[key].help)
+      items[key] = dataclasses.replace(
+          item, default=val.default, comment=val.help)
     else:
-      items[key] = item._replace(default=pytype_single_args[key].default)
+      items[key] = dataclasses.replace(item, default=val.default)
 
   # Not using configparser's write method because it doesn't support comments.
 
@@ -232,12 +255,12 @@ def generate_sample_config_or_die(filename, pytype_single_args):
     if key in formatters:
       conf.extend(formatters[key](item.sample))
     else:
-      conf.append('%s = %s' % (key, item.sample))
+      conf.append(f'{key} = {item.sample}')
     conf.append('')
   try:
     with open(filename, 'w') as f:
       f.write('\n'.join(conf))
-  except IOError as e:
+  except OSError as e:
     logging.critical('Cannot write to %s:\n%s', filename, str(e))
     sys.exit(1)
 
@@ -254,7 +277,7 @@ def read_config_file_or_die(filepath):
       sys.exit(1)
   else:
     # Try reading from setup.cfg.
-    filepath = config.find_config_file(os.getcwd())
+    filepath = config.find_config_file(path_utils.getcwd())
     if filepath and ret.read_from_file(filepath):
       logging.info('Reading config from: %s', filepath)
     else:

@@ -1,6 +1,5 @@
 """Tests for displaying errors."""
 
-from pytype import file_utils
 from pytype.tests import test_base
 from pytype.tests import test_utils
 
@@ -66,10 +65,10 @@ class ErrorTest(test_base.BaseTest):
   def test_wrong_brackets(self):
     _, errors = self.InferWithErrors("""
       from typing import List
-      def f(x: List(str)):  # not-callable[e]
+      def f(x: List(str)):  # invalid-annotation[e]
         pass
     """)
-    self.assertErrorSequences(errors, {"e": ["List"]})
+    self.assertErrorSequences(errors, {"e": ["<instance of list>"]})
 
   def test_interpreter_class_printing(self):
     _, errors = self.InferWithErrors("""
@@ -178,7 +177,7 @@ class ErrorTest(test_base.BaseTest):
     self.assertErrorSequences(errors, {"e": ["int", "Foo"]})
 
   def test_nested_proto_class(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo_bar.pyi", """
         from typing import Type
         class _Foo_DOT_Bar: ...
@@ -193,7 +192,7 @@ class ErrorTest(test_base.BaseTest):
       self.assertErrorSequences(errors, {"e": ["foo_bar.Foo.Bar"]})
 
   def test_staticmethod_in_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         class A:
           @staticmethod
@@ -239,13 +238,6 @@ class ErrorTest(test_base.BaseTest):
     """)
     self.assertErrorSequences(errors, {"e": ["str", "int"]})
 
-  def test_silence_variable_mismatch(self):
-    self.Check("""
-      x = [
-          0,
-      ]  # type: None  # pytype: disable=annotation-type-mismatch
-    """)
-
   def test_assert_type(self):
     _, errors = self.InferWithErrors("""
       from typing import Union
@@ -280,7 +272,7 @@ class ErrorTest(test_base.BaseTest):
     })
 
   def test_assert_type_import(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("pytype_extensions.pyi", """
         def assert_type(*args): ...
       """)
@@ -308,13 +300,6 @@ class ErrorTest(test_base.BaseTest):
           pass  # wrong-arg-types
     """)
 
-  def test_disable_location(self):
-    self.Check("""
-      import re
-      re.sub(
-        '', object(), '')  # pytype: disable=wrong-arg-types
-    """)
-
   def test_union_with_any(self):
     errors = self.CheckWithErrors("""
       from typing import Any, Union
@@ -332,12 +317,6 @@ class ErrorTest(test_base.BaseTest):
     """)
     self.assertErrorSequences(errors, {"e": "Optional[Union[int, str]"})
 
-  def test_skip_file_with_comment(self):
-    self.Check("""
-      # pytype: skip-file  # extra comment here
-      import nonsense
-    """)
-
   def test_nested_class(self):
     errors = self.CheckWithErrors("""
       from typing import Protocol, TypeVar
@@ -354,18 +333,6 @@ class ErrorTest(test_base.BaseTest):
     """)
     self.assertErrorSequences(errors, {"e": [
         "Method __len__ of protocol X[str] has the wrong signature in Y"]})
-
-  def test_missing_parameter_disable(self):
-    self.Check("""
-      class Foo:
-        def __iter__(self, x, y):
-          pass
-      def f(x):
-        pass
-      f(
-        x=[x for x in Foo],  # pytype: disable=missing-parameter
-      )
-    """)
 
   def test_variables_not_printed(self):
     errors = self.CheckWithErrors("""
@@ -391,14 +358,14 @@ class InPlaceOperationsTest(test_base.BaseTest):
   """Test in-place operations."""
 
   def _testOp(self, op, symbol):
-    errors = self.CheckWithErrors("""
+    errors = self.CheckWithErrors(f"""
       class A:
-        def __%s__(self, x: "A"):
+        def __{op}__(self, x: "A"):
           return None
       def f():
         v = A()
-        v %s 3  # unsupported-operands[e]
-    """ % (op, symbol))
+        v {symbol} 3  # unsupported-operands[e]
+    """)
     self.assertErrorSequences(errors, {
         "e": [symbol, "A", "int", f"__{op}__ on A", "A"]
     })
@@ -494,38 +461,6 @@ class ErrorTestPy3(test_base.BaseTest):
         return x  # bad-return-type[e]
     """)
     self.assertErrorSequences(errors, {"e": ["int", "str"]})
-
-  def test_silence_parameter_mismatch(self):
-    self.Check("""
-      def f(
-        x: int = 0.0,
-        y: str = '',
-        **kwargs,
-      ):  # pytype: disable=annotation-type-mismatch
-        pass
-    """)
-
-  @test_utils.skipFromPy((3, 8), "MAKE_FUNCTION opcode lineno changes in 3.8")
-  def test_do_not_silence_parameter_mismatch_pre38(self):
-    self.CheckWithErrors("""
-      def f(
-        x: int = 0.0,
-        y: str = '',  # annotation-type-mismatch
-        **kwargs,
-      ):
-        pass  # pytype: disable=annotation-type-mismatch
-    """)
-
-  @test_utils.skipBeforePy((3, 8), "MAKE_FUNCTION opcode lineno changes in 3.8")
-  def test_do_not_silence_parameter_mismatch(self):
-    self.CheckWithErrors("""
-      def f(  # annotation-type-mismatch
-        x: int = 0.0,
-        y: str = '',
-        **kwargs,
-      ):
-        pass  # pytype: disable=annotation-type-mismatch
-    """)
 
 
 class MatrixOperationsTest(test_base.BaseTest):

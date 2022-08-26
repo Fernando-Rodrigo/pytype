@@ -1,117 +1,7 @@
 """Test functions."""
 
-from pytype import file_utils
 from pytype.tests import test_base
 from pytype.tests import test_utils
-
-
-class TestClosures(test_base.BaseTest):
-  """Tests for closures."""
-
-  def test_error(self):
-    errors = self.CheckWithErrors("""
-      def f(x: int):
-        def g():
-          return x.upper()  # attribute-error[e]
-    """)
-    self.assertErrorRegexes(errors, {"e": r"upper.*int"})
-
-
-class TestClosuresPy3(test_base.BaseTest):
-  """Tests for closures in Python 3."""
-
-  def test_if_split_delete_deref(self):
-    ty = self.Infer("""
-      def f(a: int):
-        x = "hello"
-        def g():
-          nonlocal x
-          x = 42
-        if a:
-          g()
-        else:
-          return x
-    """)
-    self.assertTypesMatchPytd(ty, """
-      from typing import Optional
-      def f(a: int) -> Optional[str]: ...
-    """)
-
-  def test_closures_delete_deref(self):
-    self.InferWithErrors("""
-      def f():
-        x = "hello"
-        def g():
-          nonlocal x  # force x to be stored in a closure cell
-          x = 10
-        del x
-        return x  # name-error
-    """)
-
-  def test_nonlocal(self):
-    ty = self.Infer("""
-      def f():
-        x = "hello"
-        def g():
-          nonlocal x
-          x = 10
-        g()
-        return x
-    """)
-    self.assertTypesMatchPytd(ty, """
-      def f() -> int: ...
-    """)
-
-  def test_nonlocal_delete_deref(self):
-    self.InferWithErrors("""
-      def f():
-        x = True
-        def g():
-          nonlocal x
-          del x
-        g()
-        return x  # name-error
-    """)
-
-  def test_reuse_after_delete_deref(self):
-    ty = self.Infer("""
-      def f():
-        x = True
-        def g():
-          nonlocal x
-          del x
-        g()
-        x = 42
-        return x
-    """)
-    self.assertTypesMatchPytd(ty, """
-      def f() -> int: ...
-    """)
-
-  def test_closure_annotations(self):
-    errors = self.CheckWithErrors("""
-      def f():
-        a = 1
-        def g(x: int) -> int:
-          a  # makes sure g is a closure
-          return "hello"  # bad-return-type[e]
-    """)
-    self.assertErrorRegexes(errors, {"e": r"int.*str"})
-
-  def test_filter_before_delete(self):
-    # TODO(b/117463644): Remove the disable on line 7.
-    self.CheckWithErrors("""
-      from typing import Optional
-      def f(x: Optional[str]):
-        if x is None:
-          raise TypeError()
-        def nested():
-          nonlocal x
-          print(x.upper())  # pytype: disable=name-error
-          del x
-        nested()
-        return x  # name-error
-    """)
 
 
 class PreciseReturnTest(test_base.BaseTest):
@@ -379,7 +269,7 @@ class TestFunctions(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e1": r"str.*int", "e2": r"str.*int"})
 
   def test_varargs_in_pyi(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: int, *args): ...
       """)
@@ -390,7 +280,7 @@ class TestFunctions(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_varargs_in_pyi_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: int, *args): ...
       """)
@@ -441,6 +331,50 @@ class TestFunctions(test_base.BaseTest):
         pass
       def h(x):
         return g(x, *f())
+    """)
+
+  def test_namedargs_split(self):
+    self.Check("""
+      def f(x):
+        pass
+      def g(y):
+        pass
+      def h():
+        kws = {}
+        if __random__:
+          kws['x'] = 0
+          f(**kws)
+        else:
+          kws['y'] = 0
+          g(**kws)
+    """)
+
+  def test_namedargs_split_pyi(self):
+    with self.DepTree([("foo.pyi", """
+      def f(x): ...
+      def g(y): ...
+    """)]):
+      self.Check("""
+        import foo
+        def h():
+          kws = {}
+          if __random__:
+            kws['x'] = 0
+            foo.f(**kws)
+          else:
+            kws['y'] = 0
+            foo.g(**kws)
+      """)
+
+  def test_filter_none(self):
+    self.Check("""
+      import copy
+      from typing import Dict, Optional, Union
+      X = {'a': 1}
+      def f(x: Optional[Dict[str, bytes]] = None):
+        y = x or X
+        z = copy.copy(y)
+        assert_type(z, Union[Dict[str, int], Dict[str, bytes]])
     """)
 
 
@@ -770,7 +704,7 @@ class TestFunctionsPython3Feature(test_base.BaseTest):
 
   @test_utils.skipBeforePy((3, 8), "new in Python 3.8")
   def test_positional_only_parameter_pyi(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x, /, y) -> None: ...
       """)
@@ -787,7 +721,7 @@ class TestFunctionsPython3Feature(test_base.BaseTest):
 
   @test_utils.skipBeforePy((3, 8), "new in Python 3.8")
   def test_positional_and_keyword_arguments(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x, /, **kwargs) -> None: ...
       """)

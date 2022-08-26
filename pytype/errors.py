@@ -8,7 +8,7 @@ import logging
 import re
 import sys
 import typing
-from typing import Callable, Iterable, Optional, Sequence, TypeVar, Union
+from typing import Callable, IO, Iterable, Optional, Sequence, TypeVar, Union
 
 from pytype import debug
 from pytype import matcher
@@ -166,9 +166,9 @@ def _compare_traceback_strings(left, right):
 def _function_name(name, capitalize=False):
   builtin_prefix = "builtins."
   if name.startswith(builtin_prefix):
-    ret = "built-in function %s" % name[len(builtin_prefix):]
+    ret = f"built-in function {name[len(builtin_prefix):]}"
   else:
-    ret = "function %s" % name
+    ret = f"function {name}"
   if capitalize:
     return ret[0].upper() + ret[1:]
   else:
@@ -209,11 +209,12 @@ class Error:
                      occurs. e.g. the fully qualified module name that a
                      non-existent function doesn't exist on.
     traceback: Optionally, an error traceback.
+    opcode_name: Optionally, the name of the opcode that raised the error.
   """
 
   def __init__(self, severity, message, filename=None, lineno=0,
                methodname=None, details=None, traceback=None, keyword=None,
-               keyword_context=None, bad_call=None):
+               keyword_context=None, bad_call=None, opcode_name=None):
     name = _CURRENT_ERROR_NAME.get()
     assert name, ("Errors must be created from a caller annotated "
                   "with @error_name.")
@@ -231,6 +232,7 @@ class Error:
     self._keyword_context = keyword_context
     self._keyword = keyword
     self._bad_call = bad_call
+    self._opcode_name = opcode_name
 
   @classmethod
   def with_stack(cls, stack, severity, message, **kwargs):
@@ -252,6 +254,7 @@ class Error:
     else:
       return cls(severity, message, filename=opcode.code.co_filename,
                  lineno=opcode.line, methodname=opcode.code.co_name,
+                 opcode_name=opcode.__class__.__name__,
                  traceback=_make_traceback_str(stack), **kwargs)
 
   @classmethod
@@ -271,6 +274,10 @@ class Error:
   @property
   def filename(self):
     return self._filename
+
+  @property
+  def opcode_name(self):
+    return self._opcode_name
 
   @property
   def message(self):
@@ -307,7 +314,7 @@ class Error:
 
   def _position(self):
     """Return human-readable filename + line number."""
-    method = ", in %s" % self._methodname if self._methodname else ""
+    method = f", in {self._methodname}" if self._methodname else ""
 
     if self._filename:
       return "File \"%s\", line %d%s" % (self._filename,
@@ -321,13 +328,16 @@ class Error:
   def __str__(self):
     return self.as_string()
 
+  def set_lineno(self, line):
+    self._lineno = line
+
   def as_string(self, *, color=False):
     """Format the error as a friendly string, optionally with shell coloring."""
     pos = self._position()
     if pos:
       pos += ": "
     name = _COLOR_ERROR_NAME_TEMPLATE % (self._name,) if color else self._name
-    text = "%s%s [%s]" % (pos, self._message.replace("\n", "\n  "), name)
+    text = "{}{} [{}]".format(pos, self._message.replace("\n", "\n  "), name)
     if self._details:
       text += "\n  " + self._details.replace("\n", "\n  ")
     if self._traceback:
@@ -381,6 +391,8 @@ class ErrorLogBase:
       filt: A function or callable object that accepts a single argument of
           type Error and returns True if that error should be included in the
           log.  A filter of None will add all errors.
+
+    NOTE: The filter may adjust some properties of the error.
     """
     self._filter = filt
 
@@ -417,26 +429,25 @@ class ErrorLogBase:
     _log.info("Restored errorlog to checkpoint: %d errors reverted",
               len(checkpoint.errors))
 
-  def print_to_csv_file(self, filename, open_function=open):
+  def print_to_csv_file(self, fi: IO[str]):
     """Print the errorlog to a csv file."""
-    with open_function(filename, "w") as f:
-      csv_file = csv.writer(f, delimiter=",")
-      for error in self.unique_sorted_errors():
-        # pylint: disable=protected-access
-        if error._details and error._traceback:
-          details = error._details + "\n\n" + error._traceback
-        elif error._traceback:
-          details = error._traceback
-        else:
-          details = error._details
-        csv_file.writerow(
-            [error._filename,
-             error._lineno,
-             error._name,
-             error._message,
-             details])
+    csv_file = csv.writer(fi, delimiter=",", lineterminator="\n")
+    for error in self.unique_sorted_errors():
+      # pylint: disable=protected-access
+      if error._details and error._traceback:
+        details = error._details + "\n\n" + error._traceback
+      elif error._traceback:
+        details = error._traceback
+      else:
+        details = error._details
+      csv_file.writerow(
+          [error._filename,
+           error._lineno,
+           error._name,
+           error._message,
+           details])
 
-  def print_to_file(self, fi, *, color=False):
+  def print_to_file(self, fi: IO[str], *, color: bool = False):
     for error in self.unique_sorted_errors():
       print(error.as_string(color=color), file=fi)
 
@@ -527,7 +538,7 @@ class ErrorLog(ErrorLogBase):
     elif isinstance(t, abstract.AnnotationClass) or t.cls == t:
       return t.name
     else:
-      return "<instance of %s>" % self._print_as_expected_type(t.cls, t)
+      return f"<instance of {self._print_as_expected_type(t.cls, t)}>"
 
   def _print_as_actual_type(self, t, literal=False):
     if literal:
@@ -546,8 +557,9 @@ class ErrorLog(ErrorLogBase):
         t.ctx.pytd_convert.OutputMode.DETAILED):
       return self._pytd_print(generic)
 
-  def _print_as_return_types(self, node, formal, actual, bad):
+  def _print_as_return_types(self, node, bad):
     """Print the actual and expected values for a return type."""
+    formal = bad[0].expected.typ
     convert = formal.ctx.pytd_convert
     with convert.set_output_mode(convert.OutputMode.DETAILED):
       expected = self._pytd_print(formal.get_instance_type(node))
@@ -559,7 +571,9 @@ class ErrorLog(ErrorLogBase):
       output_mode = convert.OutputMode.DETAILED
     with convert.set_output_mode(output_mode):
       bad_actual = self._pytd_print(pytd_utils.JoinTypes(
-          view[actual].data.to_type(node, view=view) for view, _ in bad))
+          match.actual_binding.data.to_type(node, view=match.view)
+          for match in bad))
+      actual = bad[0].actual
       if len(actual.bindings) > len(bad):
         full_actual = self._pytd_print(pytd_utils.JoinTypes(
             v.to_type(node) for v in actual.data))
@@ -570,16 +584,15 @@ class ErrorLog(ErrorLogBase):
     error_details = self._prepare_errorlog_details(bad)
     return (fmt(expected), fmt(bad_actual), fmt(full_actual), error_details)
 
-  def _print_as_function_def(self, fn):
-    assert isinstance(fn, abstract.Function)
+  def _print_as_function_def(self, fn: abstract.Function) -> str:
     convert = fn.ctx.pytd_convert
     name = fn.name.rsplit(".", 1)[-1]  # We want `def bar()` not `def Foo.bar()`
     with convert.set_output_mode(convert.OutputMode.DETAILED):
       pytd_def = convert.value_to_pytd_def(fn.ctx.root_node, fn, name)
     return pytd_utils.Print(pytd_def)
 
-  def _print_protocol_error(self, error):
-    """Pretty-print the matcher.ProtocolError instance."""
+  def _print_protocol_error(self, error: matcher.ProtocolError) -> str:
+    """Pretty-print the protocol error."""
     convert = error.left_type.ctx.pytd_convert
     with convert.set_output_mode(convert.OutputMode.DETAILED):
       left = self._pytd_print(error.left_type.get_instance_type())
@@ -624,10 +637,10 @@ class ErrorLog(ErrorLogBase):
       ret += "\nTypedDict extra keys: " + ", ".join(error.extra)
     if error.bad:
       ret += "\nTypedDict type errors: "
-      for k, v, typ, bad in error.bad:
-        for view, _ in bad:
-          actual = self._print_as_actual_type(view[v].data)
-          expected = self._print_as_expected_type(typ)
+      for k, bad in error.bad:
+        for match in bad:
+          actual = self._print_as_actual_type(match.actual_binding.data)
+          expected = self._print_as_expected_type(match.expected.typ)
           ret += f"\n  {{'{k}': ...}}: expected {expected}, got {actual}"
     return ret
 
@@ -642,8 +655,8 @@ class ErrorLog(ErrorLogBase):
   def _prepare_errorlog_details(self, bad):
     """Prepare printable annotation matching errors."""
     details = collections.defaultdict(set)
-    for _, err in bad:
-      d = self._print_error_details(err)
+    for match in bad:
+      d = self._print_error_details(match.error_details)
       for i, detail in enumerate(d):
         if detail:
           details[i].add(detail)
@@ -669,14 +682,14 @@ class ErrorLog(ErrorLogBase):
         else:
           new_types.append(t)
       if literal_contents:
-        literal = "Literal[%s]" %", ".join(sorted(literal_contents))
+        literal = f"Literal[{', '.join(sorted(literal_contents))}]"
         new_types.append(literal)
       if len(new_types) > 1:
-        out = "Union[%s]" % ", ".join(sorted(new_types))
+        out = f"Union[{', '.join(sorted(new_types))}]"
       else:
         out = new_types[0]
       if optional:
-        out = "Optional[%s]" % out
+        out = f"Optional[{out}]"
       return out
     else:
       return "nothing"
@@ -703,7 +716,7 @@ class ErrorLog(ErrorLogBase):
     for prefix, name in self._iter_sig(sig):
       suffix = " = ..." if name in sig.defaults else ""
       if bad_param and name == bad_param.name:
-        type_str = self._print_as_expected_type(bad_param.expected)
+        type_str = self._print_as_expected_type(bad_param.typ)
         suffix = ": " + type_str + suffix
       yield prefix, name, suffix
 
@@ -748,7 +761,7 @@ class ErrorLog(ErrorLogBase):
 
   @_error_name("pyi-error")
   def pyi_error(self, stack, name, error):
-    self.error(stack, "Couldn't import pyi for %r" % name, str(error),
+    self.error(stack, f"Couldn't import pyi for {name!r}", str(error),
                keyword=name)
 
   @_error_name("attribute-error")
@@ -763,26 +776,26 @@ class ErrorLog(ErrorLogBase):
     else:
       details = None
     self.error(
-        stack, "No attribute %r on %s" % (attr_name, obj_repr), details=details,
+        stack, f"No attribute {attr_name!r} on {obj_repr}", details=details,
         keyword=attr_name)
 
   @_error_name("not-writable")
   def not_writable(self, stack, obj, attr_name):
     obj_values = obj.ctx.convert.merge_values([obj])
     obj_repr = self._print_as_actual_type(obj_values)
-    self.error(stack, "Can't assign attribute %r on %s" % (attr_name, obj_repr),
+    self.error(stack, f"Can't assign attribute {attr_name!r} on {obj_repr}",
                keyword=attr_name, keyword_context=obj_repr)
 
   @_error_name("module-attr")
   def _module_attr(self, stack, binding, attr_name):
     module_name = binding.data.name
-    self.error(stack, "No attribute %r on module %r" % (attr_name, module_name),
+    self.error(stack, f"No attribute {attr_name!r} on module {module_name!r}",
                keyword=attr_name, keyword_context=module_name)
 
   def attribute_error(self, stack, binding, attr_name):
     if attr_name in slots.SYMBOL_MAPPING:
       obj = self._print_as_actual_type(binding.data)
-      details = "No attribute %r on %s" % (attr_name, obj)
+      details = f"No attribute {attr_name!r} on {obj}"
       self._unsupported_operands(stack, attr_name, obj, details=details)
     elif isinstance(binding.data, abstract.Module):
       self._module_attr(stack, binding, attr_name)
@@ -792,23 +805,25 @@ class ErrorLog(ErrorLogBase):
   @_error_name("unbound-type-param")
   def unbound_type_param(self, stack, obj, attr_name, type_param_name):
     self.error(
-        stack, "Can't access attribute %r on %s" % (attr_name, obj.name),
-        "No binding for type parameter %s" % type_param_name, keyword=attr_name,
+        stack, f"Can't access attribute {attr_name!r} on {obj.name}",
+        f"No binding for type parameter {type_param_name}", keyword=attr_name,
         keyword_context=obj.name)
 
   @_error_name("name-error")
   def name_error(self, stack, name, details=None):
     self.error(
-        stack, "Name %r is not defined" % name, keyword=name, details=details)
+        stack, f"Name {name!r} is not defined", keyword=name, details=details)
 
   @_error_name("import-error")
   def import_error(self, stack, module_name):
-    self.error(stack, "Can't find module %r." % module_name,
+    self.error(stack, f"Can't find module {module_name!r}.",
                keyword=module_name)
 
   def _invalid_parameters(self, stack, message, bad_call):
     """Log an invalid parameters error."""
-    sig, passed_args, bad_param = bad_call
+    sig = bad_call.sig
+    passed_args = bad_call.passed_args
+    bad_param = bad_call.bad_param
     expected = self._print_args(self._iter_expected(sig, bad_param), bad_param)
     literal = "Literal[" in expected
     actual = self._print_args(
@@ -857,9 +872,9 @@ class ErrorLog(ErrorLogBase):
       operator, left_operand, right_operand = operation
       operator_name = _function_name(operator, capitalize=True)
       expected_right_operand = self._print_as_expected_type(
-          bad_call.bad_param.expected)
-      details = "%s on %s expects %s" % (
-          operator_name, left_operand, expected_right_operand)
+          bad_call.bad_param.typ)
+      details = (f"{operator_name} on {left_operand} expects "
+                 f"{expected_right_operand}")
       self._unsupported_operands(
           stack, operator, left_operand, right_operand, details=details)
     else:
@@ -876,10 +891,10 @@ class ErrorLog(ErrorLogBase):
   def wrong_keyword_args(self, stack, name, bad_call, extra_keywords):
     """A function was called with extra keywords."""
     if len(extra_keywords) == 1:
-      message = "Invalid keyword argument %s to %s" % (
+      message = "Invalid keyword argument {} to {}".format(
           extra_keywords[0], _function_name(name))
     else:
-      message = "Invalid keyword arguments %s to %s" % (
+      message = "Invalid keyword arguments {} to {}".format(
           "(" + ", ".join(sorted(extra_keywords)) + ")",
           _function_name(name))
     self._invalid_parameters(stack, message, bad_call)
@@ -887,25 +902,25 @@ class ErrorLog(ErrorLogBase):
   @_error_name("missing-parameter")
   def missing_parameter(self, stack, name, bad_call, missing_parameter):
     """A function call is missing parameters."""
-    message = "Missing parameter %r in call to %s" % (
+    message = "Missing parameter {!r} in call to {}".format(
         missing_parameter, _function_name(name))
     self._invalid_parameters(stack, message, bad_call)
 
   @_error_name("not-callable")
-  def not_callable(self, stack, func):
+  def not_callable(self, stack, func, details=None):
     """Calling an object that isn't callable."""
     if isinstance(func, abstract.InterpreterFunction) and func.is_overload:
       prefix = "@typing.overload-decorated "
     else:
       prefix = ""
-    message = "%s%r object is not callable" % (prefix, func.name)
-    self.error(stack, message, keyword=func.name)
+    message = f"{prefix}{func.name!r} object is not callable"
+    self.error(stack, message, keyword=func.name, details=details)
 
   @_error_name("not-indexable")
   def not_indexable(self, stack, name, generic_warning=False):
-    message = "class %s is not indexable" % name
+    message = f"class {name} is not indexable"
     if generic_warning:
-      self.error(stack, message, "(%r does not subclass Generic)" % name,
+      self.error(stack, message, f"({name!r} does not subclass Generic)",
                  keyword=name)
     else:
       self.error(stack, message, keyword=name)
@@ -913,19 +928,19 @@ class ErrorLog(ErrorLogBase):
   @_error_name("not-instantiable")
   def not_instantiable(self, stack, cls):
     """Instantiating an abstract class."""
-    message = "Can't instantiate %s with abstract methods %s" % (
+    message = "Can't instantiate {} with abstract methods {}".format(
         cls.full_name, ", ".join(sorted(cls.abstract_methods)))
     self.error(stack, message)
 
   @_error_name("ignored-abstractmethod")
   def ignored_abstractmethod(self, stack, cls_name, method_name):
-    message = "Stray abc.abstractmethod decorator on method %s" % method_name
+    message = f"Stray abc.abstractmethod decorator on method {method_name}"
     self.error(stack, message,
-               details="(%s does not have metaclass abc.ABCMeta)" % cls_name)
+               details=f"({cls_name} does not have metaclass abc.ABCMeta)")
 
   @_error_name("ignored-metaclass")
   def ignored_metaclass(self, stack, cls, metaclass):
-    message = "Metaclass %s on class %s ignored in Python 3" % (metaclass, cls)
+    message = f"Metaclass {metaclass} on class {cls} ignored in Python 3"
     self.error(stack, message)
 
   @_error_name("duplicate-keyword-argument")
@@ -963,6 +978,11 @@ class ErrorLog(ErrorLogBase):
           stack, error.name, error.bad_call, error.duplicate)
     elif isinstance(error, function.UndefinedParameterError):
       self.name_error(stack, error.name)
+    elif isinstance(error, typed_dict_overlay.TypedDictKeyMissing):
+      self.typed_dict_error(stack, error.typed_dict, error.name)
+    elif isinstance(error, function.DictKeyMissing):
+      # We don't report DictKeyMissing because the false positive rate is high.
+      pass
     else:
       raise AssertionError(error)
 
@@ -970,14 +990,14 @@ class ErrorLog(ErrorLogBase):
   def base_class_error(self, stack, base_var, details=None):
     base_cls = self._join_printed_types(
         self._print_as_expected_type(t) for t in base_var.data)
-    self.error(stack, "Invalid base class: %s" % base_cls,
+    self.error(stack, f"Invalid base class: {base_cls}",
                details=details, keyword=base_cls)
 
   @_error_name("bad-return-type")
-  def bad_return_type(self, stack, node, formal, actual, bad):
+  def bad_return_type(self, stack, node, bad):
     """Logs a [bad-return-type] error."""
     expected, bad_actual, full_actual, error_details = (
-        self._print_as_return_types(node, formal, actual, bad))
+        self._print_as_return_types(node, bad))
     if full_actual == bad_actual:
       message = "bad return type"
     else:
@@ -999,9 +1019,8 @@ class ErrorLog(ErrorLogBase):
     self.error(stack, message, details)
 
   @_error_name("bad-concrete-type")
-  def bad_concrete_type(self, stack, node, formal, actual, bad, details=None):
-    expected, actual, _, error_details = (
-        self._print_as_return_types(node, formal, actual, bad))
+  def bad_concrete_type(self, stack, node, bad, details=None):
+    expected, actual, _, error_details = self._print_as_return_types(node, bad)
     full_details = ["       Expected: ", expected, "\n",
                     "Actually passed: ", actual]
     if details:
@@ -1021,16 +1040,7 @@ class ErrorLog(ErrorLogBase):
     if name:
       return f"'{name}: {typ}'"
     elif len(var.data) == 1 and hasattr(val, "pyval"):
-      # For PythonConstants, we want to print the underlying Python value.
-      # But for everything else (e.g. Variables) just use "...".
-      # This provides clearer error messages that show the exact values that
-      # are related to the error while preventing implementation details from
-      # leaking into error messages.
-      def _ellipsis_printer(val):
-        if isinstance(val, mixin.PythonConstant):
-          return val.str_of_constant(_ellipsis_printer)
-        return "..."
-      name = _ellipsis_printer(val)
+      name = abstract_utils.show_constant(val)
       return f"'{name}: {typ}'"
     else:
       return f"'{typ}'"
@@ -1038,9 +1048,9 @@ class ErrorLog(ErrorLogBase):
   def unsupported_operands(self, stack, operator, var1, var2):
     left = self._show_variable(var1)
     right = self._show_variable(var2)
-    details = "No attribute %r on %s" % (operator, left)
+    details = f"No attribute {operator!r} on {left}"
     if operator in slots.REVERSE_NAME_MAPPING:
-      details += " or %r on %s" % (slots.REVERSE_NAME_MAPPING[operator], right)
+      details += f" or {slots.REVERSE_NAME_MAPPING[operator]!r} on {right}"
     self._unsupported_operands(stack, operator, left, right, details=details)
 
   @_error_name("unsupported-operands")
@@ -1076,8 +1086,8 @@ class ErrorLog(ErrorLogBase):
     if isinstance(param_or_params, abstract.BaseValue):
       return self._print_as_expected_type(param_or_params)
     else:
-      return "[%s]" % ", ".join(
-          self._print_params_helper(p) for p in param_or_params)
+      return "[{}]".format(
+          ", ".join(self._print_params_helper(p) for p in param_or_params))
 
   def wrong_annotation_parameter_count(
       self, stack, annot: abstract.BaseValue,
@@ -1087,7 +1097,7 @@ class ErrorLog(ErrorLogBase):
     base_type = self._print_as_expected_type(annot)
     full_type = base_type + self._print_params_helper(params)
     if template:
-      templated_type = "%s[%s]" % (base_type, ", ".join(template))
+      templated_type = f"{base_type}[{', '.join(template)}]"
     else:
       templated_type = base_type
     details = "%s expected %d parameter%s, got %d" % (
@@ -1097,7 +1107,7 @@ class ErrorLog(ErrorLogBase):
 
   def invalid_ellipses(self, stack, indices, container_name):
     if indices:
-      details = "Not allowed at %s %s in %s" % (
+      details = "Not allowed at {} {} in {}".format(
           "index" if len(indices) == 1 else "indices",
           ", ".join(str(i) for i in sorted(indices)),
           container_name)
@@ -1123,17 +1133,17 @@ class ErrorLog(ErrorLogBase):
       suffix = ""
     else:
       suffix = "for " + name
-    annot_string = "%r " % annot_string if annot_string else ""
-    self.error(stack, "Invalid type annotation %s%s" % (annot_string, suffix),
+    annot_string = f"{annot_string!r} " if annot_string else ""
+    self.error(stack, f"Invalid type annotation {annot_string}{suffix}",
                details=details)
 
   @_error_name("mro-error")
   def mro_error(self, stack, name, mro_seqs, details=None):
     seqs = []
     for seq in mro_seqs:
-      seqs.append("[%s]" % ", ".join(cls.name for cls in seq))
-    suffix = ": %s" % ", ".join(seqs) if seqs else ""
-    msg = "%s has invalid inheritance%s." % (name, suffix)
+      seqs.append(f"[{', '.join(cls.name for cls in seq)}]")
+    suffix = f": {', '.join(seqs)}" if seqs else ""
+    msg = f"{name} has invalid inheritance{suffix}."
     self.error(stack, msg, keyword=name, details=details)
 
   @_error_name("invalid-directive")
@@ -1143,7 +1153,7 @@ class ErrorLog(ErrorLogBase):
 
   @_error_name("late-directive")
   def late_directive(self, filename, lineno, name):
-    message = "%s disabled from here to the end of the file" % name
+    message = f"{name} disabled from here to the end of the file"
     details = ("Consider limiting this directive's scope or moving it to the "
                "top of the file.")
     self._add(Error(SEVERITY_WARNING, message, details=details,
@@ -1151,7 +1161,7 @@ class ErrorLog(ErrorLogBase):
 
   @_error_name("not-supported-yet")
   def not_supported_yet(self, stack, feature, details=None):
-    self.error(stack, "%s not supported yet" % feature, details=details)
+    self.error(stack, f"{feature} not supported yet", details=details)
 
   @_error_name("python-compiler-error")
   def python_compiler_error(self, filename, lineno, message):
@@ -1160,7 +1170,7 @@ class ErrorLog(ErrorLogBase):
 
   @_error_name("recursion-error")
   def recursion_error(self, stack, name):
-    self.error(stack, "Detected recursion in %s" % name, keyword=name)
+    self.error(stack, f"Detected recursion in {name}", keyword=name)
 
   @_error_name("redundant-function-type-comment")
   def redundant_function_type_comment(self, filename, lineno):
@@ -1171,13 +1181,13 @@ class ErrorLog(ErrorLogBase):
 
   @_error_name("invalid-function-type-comment")
   def invalid_function_type_comment(self, stack, comment, details=None):
-    self.error(stack, "Invalid function type comment: %s" % comment,
+    self.error(stack, f"Invalid function type comment: {comment}",
                details=details)
 
   @_error_name("ignored-type-comment")
   def ignored_type_comment(self, filename, lineno, comment):
     self._add(Error(
-        SEVERITY_WARNING, "Stray type comment: %s" % comment,
+        SEVERITY_WARNING, f"Stray type comment: {comment}",
         filename=filename, lineno=lineno))
 
   @_error_name("invalid-typevar")
@@ -1185,7 +1195,7 @@ class ErrorLog(ErrorLogBase):
     if bad_call:
       self._invalid_parameters(stack, comment, bad_call)
     else:
-      self.error(stack, "Invalid TypeVar: %s" % comment)
+      self.error(stack, f"Invalid TypeVar: {comment}")
 
   @_error_name("invalid-namedtuple-arg")
   def invalid_namedtuple_arg(self, stack, badname=None, err_msg=None):
@@ -1210,7 +1220,7 @@ class ErrorLog(ErrorLogBase):
     prettify = lambda v, label: "%d %s%s" % (v, label, "" if v == 1 else "s")
     vals_str = prettify(num_vals, "value")
     vars_str = prettify(num_vars, "variable")
-    msg = "Cannot unpack %s into %s" % (vals_str, vars_str)
+    msg = f"Cannot unpack {vals_str} into {vars_str}"
     self.error(stack, msg, keyword=vals_str)
 
   @_error_name("reveal-type")
@@ -1271,18 +1281,18 @@ class ErrorLog(ErrorLogBase):
       annot_string += f" (Did you mean 'typing.Optional[{annot_string}]'?)"
     additional_details = f"\n\n{details}" if details else ""
     additional_details += "".join(self._print_error_details(error_details))
-    details = ("Annotation: %s\n" % annot_string +
-               "Assignment: %s" % actual_string +
+    details = (f"Annotation: {annot_string}\n" +
+               f"Assignment: {actual_string}" +
                additional_details)
     if len(binding.variable.bindings) > 1:
       # Joining the printed types rather than merging them before printing
       # ensures that we print all of the options when 'Any' is among them.
       # We don't need to print this if there is only 1 unique type.
-      print_types = set(self._print_as_actual_type(v, literal=literal)
-                        for v in binding.variable.data)
+      print_types = {self._print_as_actual_type(v, literal=literal)
+                     for v in binding.variable.data}
       if len(print_types) > 1:
-        details += "\nIn assignment of type: %s" % self._join_printed_types(
-            print_types)
+        details += ("\nIn assignment of type: "
+                    f"{self._join_printed_types(print_types)}")
     if typed_dict is not None:
       suffix = f" for key {name} in TypedDict {typed_dict.class_name}"
     elif name is not None:
@@ -1308,7 +1318,7 @@ class ErrorLog(ErrorLogBase):
         break
     else:
       assert False, f"{obj.cls.full_name} is not a container"
-    details = "Container: %s\n" % self._print_as_generic_type(cls)
+    details = f"Container: {self._print_as_generic_type(cls)}\n"
     allowed_contained = ""
     new_contained = ""
     for formal in cls.formal_type_parameters.keys():
@@ -1319,14 +1329,14 @@ class ErrorLog(ErrorLogBase):
         new_content = self._join_printed_types(
             sorted(self._print_as_actual_type(v)
                    for v in set(values.data) - set(params.data)))
-        allowed_contained += "  %s: %s\n" % (formal, allowed_content)
-        new_contained += "  %s: %s\n" % (formal, new_content)
+        allowed_contained += f"  {formal}: {allowed_content}\n"
+        new_contained += f"  {formal}: {new_content}\n"
     annotation = self._print_as_expected_type(cls)
     details += ("Allowed contained types (from annotation %s):\n%s"
                 "New contained types:\n%s") % (
                     annotation, allowed_contained, new_contained)
     suffix = "" if name is None else " for " + name
-    err_msg = "New container type%s does not match type annotation" % suffix
+    err_msg = f"New container type{suffix} does not match type annotation"
     self.error(stack, err_msg, details=details)
 
   @_error_name("invalid-function-definition")
@@ -1346,7 +1356,8 @@ class ErrorLog(ErrorLogBase):
     if name:
       err_msg = f"TypedDict {obj.class_name} does not contain key {name}"
     else:
-      err_msg = f"TypedDict {obj.class_name} requires all keys to be strings"
+      err_msg = (f"TypedDict {obj.class_name} requires all keys to be constant "
+                 "strings")
     self.error(stack, err_msg)
 
   @_error_name("final-error")
@@ -1378,12 +1389,16 @@ class ErrorLog(ErrorLogBase):
   @_error_name("signature-mismatch")
   def overriding_signature_mismatch(self, stack, base_signature,
                                     class_signature, details=None):
+    """Signature mismatch between overridden and overriding class methods."""
     base_signature = self._normalize_signature(base_signature)
     class_signature = self._normalize_signature(class_signature)
-    err_msg = (f"Overriding method signature mismatch.\n"
-               f"Base signature: '{base_signature}'.\n"
-               f"Subclass signature: '{class_signature}'.")
-    self.error(stack, err_msg, details=details)
+    signatures = (f"Base signature: '{base_signature}'.\n"
+                  f"Subclass signature: '{class_signature}'.")
+    if details:
+      details = signatures + "\n" + details
+    else:
+      details = signatures
+    self.error(stack, "Overriding method signature mismatch", details=details)
 
   @_error_name("final-error")
   def assigning_to_final(self, stack, name, local):
@@ -1396,7 +1411,7 @@ class ErrorLog(ErrorLogBase):
   def subclassing_final_class(self, stack, base_var, details=None):
     base_cls = self._join_printed_types(
         self._print_as_expected_type(t) for t in base_var.data)
-    self.error(stack, "Cannot subclass final class: %s" % base_cls,
+    self.error(stack, f"Cannot subclass final class: {base_cls}",
                details=details, keyword=base_cls)
 
   @_error_name("final-error")

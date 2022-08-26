@@ -4,14 +4,16 @@ import collections
 import dataclasses
 import itertools
 
-from typing import AbstractSet, Any, Optional
+from typing import AbstractSet, Any, Dict, Optional, Sequence, Tuple
 
+from pytype import state
 from pytype import utils
 from pytype.abstract import abstract
 from pytype.abstract import abstract_utils
 from pytype.abstract import mixin
 from pytype.overlays import typing_overlay
 from pytype.pytd import pytd_utils
+from pytype.typegraph import cfg
 
 
 @dataclasses.dataclass
@@ -32,9 +34,11 @@ class AnnotationUtils(utils.ContextWeakrefMixin):
               for name, annot in annotations.items()}
     return annotations
 
-  def _get_type_parameter_subst(self, node, annot, substs, instantiate_unbound):
+  def _get_type_parameter_subst(
+      self, node: cfg.CFGNode, annot: abstract.TypeParameter,
+      substs: Sequence[Dict[str, cfg.Variable]], instantiate_unbound: bool
+  ) -> abstract.BaseValue:
     """Helper for sub_one_annotation."""
-    assert isinstance(annot, abstract.TypeParameter)
     # We use the given substitutions to bind the annotation if
     # (1) every subst provides at least one binding, and
     # (2) none of the bindings are ambiguous, and
@@ -54,6 +58,14 @@ class AnnotationUtils(utils.ContextWeakrefMixin):
     return self.ctx.convert.merge_classes(vals)
 
   def sub_one_annotation(self, node, annot, substs, instantiate_unbound=True):
+
+    def get_type_parameter_subst(annotation):
+      return self._get_type_parameter_subst(node, annotation, substs,
+                                            instantiate_unbound)
+
+    return self._do_sub_one_annotation(node, annot, get_type_parameter_subst)
+
+  def _do_sub_one_annotation(self, node, annot, get_type_parameter_subst_fn):
     """Apply type parameter substitutions to an annotation."""
     # We push annotations onto 'stack' and move them to the 'done' stack as they
     # are processed. For each annotation, we also track an 'inner_type_keys'
@@ -77,10 +89,10 @@ class AnnotationUtils(utils.ContextWeakrefMixin):
           if cur not in late_annotations:
             param_strings = []
             for t in utils.unique_list(self.get_type_parameters(cur)):
-              s = pytd_utils.Print(self._get_type_parameter_subst(
-                  node, t, substs, instantiate_unbound).get_instance_type(node))
+              s = pytd_utils.Print(
+                  get_type_parameter_subst_fn(t).get_instance_type(node))
               param_strings.append(s)
-            expr = "%s[%s]" % (cur.expr, ", ".join(param_strings))
+            expr = f"{cur.expr}[{', '.join(param_strings)}]"
             late_annot = abstract.LateAnnotation(expr, cur.stack, cur.ctx)
             late_annotations[cur] = late_annot
           done.append(late_annotations[cur])
@@ -107,10 +119,54 @@ class AnnotationUtils(utils.ContextWeakrefMixin):
                     late_annot.expr.split("[", 1)[0]].append(late_annot)
           done.append(done_annot)
       else:
-        done.append(self._get_type_parameter_subst(
-            node, cur, substs, instantiate_unbound))
+        done.append(get_type_parameter_subst_fn(cur))
     assert len(done) == 1
     return done[0]
+
+  def sub_annotations_for_parameterized_class(
+      self, cls: abstract.ParameterizedClass,
+      annotations: Dict[str, abstract.BaseValue]
+  ) -> Dict[str, abstract.BaseValue]:
+    """Apply type parameter substitutions to a dictionary of annotations.
+
+    Args:
+      cls: ParameterizedClass that defines type parameter substitutions.
+      annotations: A dictionary of annotations to which type parameter
+        substition should be applied.
+
+    Returns:
+      Annotations with type parameters substituted.
+    """
+    formal_type_parameters = cls.get_formal_type_parameters()
+
+    def get_type_parameter_subst(
+        annotation: abstract.TypeParameter) -> Optional[abstract.BaseValue]:
+      # Normally the type parameter module is set correctly at this point.
+      # Except for the case when a method that references this type parameter
+      # is inherited in a subclass that does not specialize this parameter:
+      #   class A(Generic[T]):
+      #     def f(self, t: T): ...
+      #
+      #   class B(Generic[T], A[T]):
+      #     pass
+      #
+      #   class C(B[int]): ...
+      # In this case t in A[T].f will be annotated with T with no module set,
+      # since we don't know the correct module until T is specialized in
+      # B[int].
+      annotation = annotation.with_module(cls.full_name)
+      # Method parameter can be annotated with a typevar that doesn't
+      # belong to the class template:
+      #   class A(Generic[T]):
+      #     def f(self, t: U): ...
+      # In this case we return it as is.
+      return formal_type_parameters.get(annotation.full_name, annotation)
+
+    return {
+        name: self._do_sub_one_annotation(self.ctx.root_node, annot,
+                                          get_type_parameter_subst)
+        for name, annot in annotations.items()
+    }
 
   def get_late_annotations(self, annot):
     if annot.is_late_annotation() and not annot.resolved:
@@ -429,13 +485,15 @@ class AnnotationUtils(utils.ContextWeakrefMixin):
       if resolved is not None:
         func.signature.set_annotation(name, resolved)
 
-  def _process_one_annotation(self, node, annotation, name, stack):
+  def _process_one_annotation(
+      self, node: cfg.CFGNode, annotation: abstract.BaseValue,
+      # We require `stack` to be a tuple to make sure we pass in a frozen
+      # snapshot of the frame stack, rather than the actual stack, since late
+      # annotations need to snapshot the stack at time of creation in order to
+      # get the right line information for error messages.
+      name: Optional[str], stack: Tuple[state.FrameType, ...]
+  ) -> Optional[abstract.BaseValue]:
     """Change annotation / record errors where required."""
-    # Make sure we pass in a frozen snapshot of the frame stack, rather than the
-    # actual stack, since late annotations need to snapshot the stack at time of
-    # creation in order to get the right line information for error messages.
-    assert isinstance(stack, tuple), "stack must be an immutable sequence"
-
     if isinstance(annotation, abstract.AnnotationContainer):
       annotation = annotation.base_cls
 

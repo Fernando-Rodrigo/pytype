@@ -1,6 +1,5 @@
 """Tests for inline annotations."""
 
-from pytype import file_utils
 from pytype.tests import test_base
 from pytype.tests import test_utils
 
@@ -443,7 +442,7 @@ class AnnotationTest(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e": r"Expected: FooBar"})
 
   def test_unknown_argument(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         def factory() -> type: ...
       """)
@@ -971,7 +970,7 @@ class AnnotationTest(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e": r"Ellipsis.*Dict"})
 
   def test_custom_container(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Generic
         T = TypeVar("T")
@@ -1112,7 +1111,7 @@ class AnnotationTest(test_base.BaseTest):
     """)
 
   def test_nested_forward_ref_to_import(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         class Foo: ...
       """)
@@ -1256,7 +1255,7 @@ class TestAnnotationsPython3Feature(test_base.BaseTest):
     """)
 
   def test_imported_container_type(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Dict, List, Union
         MyDict = Dict[str, int]
@@ -1315,6 +1314,29 @@ class TestStringifiedAnnotations(test_base.BaseTest):
       assert_type(A().c, Optional[B])
     """)
 
+  def test_generic_forward_reference_to_collection(self):
+    # Makes sure that we don't get an error when set[int] is converted to
+    # typing.Set[int] (since typing.Set is not imported).
+    ty = self.Infer("""
+      from __future__ import annotations
+      from typing import Generic, TypeVar
+
+      T = TypeVar("T")
+
+      class A(Generic[T]):
+        def f(self) -> A[set[int]]:
+          return self
+    """)
+    self.assertTypesMatchPytd(ty, """
+      import __future__
+      import typing
+      from typing import Generic, Set, TypeVar
+      annotations: __future__._Feature
+      T = TypeVar('T')
+      class A(Generic[T]):
+        def f(self) -> A[Set[int]]: ...
+   """)
+
 
 class EllipsisTest(test_base.BaseTest):
   """Tests usage of '...' to mean "inferred type".
@@ -1370,6 +1392,37 @@ class EllipsisTest(test_base.BaseTest):
       class Foo:
         x: int
         def f(self) -> None: ...
+    """)
+
+
+class BareAnnotationTest(test_base.BaseTest):
+  """Tests variable annotations without assignment."""
+
+  @test_utils.skipBeforePy((3, 8), "requires ast features in 3.8+")
+  def test_bare_annotations(self):
+    ty = self.Infer("""
+      class Foo:
+        a: bool
+        def __init__(self):
+          self.x: int
+          self.y: list[
+                    int]
+          z: str
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import List
+      class Foo:
+        a: bool
+        x: int
+        y: List[int]
+        def __init__(self) -> None: ...
+    """)
+
+  def test_global(self):
+    self.Check("""
+      x: int
+      def f() -> int:
+        return x
     """)
 
 

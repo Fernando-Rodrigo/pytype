@@ -3,9 +3,9 @@
 File 3/3. Split into parts to enable better test parallelism.
 """
 
-from pytype import file_utils
 from pytype.abstract import abstract_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class BuiltinTests3(test_base.BaseTest):
@@ -65,9 +65,9 @@ class BuiltinTests3(test_base.BaseTest):
     """)
 
   def test_implicit_typevar_import(self):
-    ty, _ = self.InferWithErrors("""
-      v = %s  # name-error
-    """ % abstract_utils.T)
+    ty, _ = self.InferWithErrors(f"""
+      v = {abstract_utils.T}  # name-error
+    """)
     self.assertTypesMatchPytd(ty, """
       from typing import Any
       v = ...  # type: Any
@@ -133,7 +133,7 @@ class BuiltinTests3(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e": r"1.*4"})
 
   def test_newlines(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("newlines.txt", """
           1
           2
@@ -328,7 +328,7 @@ class BuiltinTests3(test_base.BaseTest):
     """)
 
   def test_path(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo/__init__.py")
       self.Check("""
         import foo

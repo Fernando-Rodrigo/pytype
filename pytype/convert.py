@@ -2,6 +2,7 @@
 
 import logging
 import types
+from typing import Any, Dict
 
 from pytype import blocks
 from pytype import datatypes
@@ -65,7 +66,7 @@ class Converter(utils.ContextWeakrefMixin):
     super().__init__(ctx)
     ctx.convert = self  # to make constant_to_value calls below work
 
-    self._convert_cache = {}
+    self._convert_cache: Dict[Any, Any] = {}
     self._resolved_late_types = {}  # performance cache
 
     # Initialize primitive_classes to empty to allow constant_to_value to run.
@@ -144,7 +145,7 @@ class Converter(utils.ContextWeakrefMixin):
     if constant_type is None:
       return "constant"
     elif isinstance(constant_type, tuple):
-      return "(%s)" % ", ".join(self.constant_name(c) for c in constant_type)
+      return f"({', '.join(self.constant_name(c) for c in constant_type)})"
     else:
       return constant_type.__name__
 
@@ -169,7 +170,7 @@ class Converter(utils.ContextWeakrefMixin):
         isinstance(val.pyval, constant_type or object)):
       return val.pyval
     name = self.constant_name(constant_type)
-    raise abstract_utils.ConversionError("%s is not of type %s" % (val, name))
+    raise abstract_utils.ConversionError(f"{val} is not of type {name}")
 
   def name_to_value(self, name, subst=None, ast=None):
     if ast is None:
@@ -197,7 +198,7 @@ class Converter(utils.ContextWeakrefMixin):
     elif value is False:
       return self.false.to_variable(node)
     else:
-      raise ValueError("Invalid bool value: %r" % value)
+      raise ValueError(f"Invalid bool value: {value!r}")
 
   def build_int(self, node):
     i = self.primitive_class_instances[int]
@@ -303,7 +304,7 @@ class Converter(utils.ContextWeakrefMixin):
         return self.primitive_class_instances[data_type]
     return data
 
-  def _create_new_unknown_value(self, action):
+  def _create_new_unknown_value(self, action) -> abstract.Unknown:
     if not action or not self.ctx.vm.frame:
       return abstract.Unknown(self.ctx)
     # We allow only one Unknown at each point in the program, regardless of
@@ -338,14 +339,15 @@ class Converter(utils.ContextWeakrefMixin):
       assert arg_type.base_cls is self.tuple_type
       return arg_type.get_formal_type_parameter(abstract_utils.T)
 
-  def _copy_type_parameters(self, old_container, new_container_name):
+  def _copy_type_parameters(
+      self, old_container: abstract.Class, new_container_name: str
+  ) -> abstract.BaseValue:
     new_container = self.name_to_value(new_container_name)
     if isinstance(old_container, abstract.ParameterizedClass):
       return abstract.ParameterizedClass(new_container,
                                          old_container.formal_type_parameters,
                                          self.ctx)
     else:
-      assert isinstance(old_container, abstract.Class)
       return new_container
 
   def widen_type(self, container):
@@ -374,7 +376,9 @@ class Converter(utils.ContextWeakrefMixin):
       An abstract.BaseValue created by merging the instances' classes.
     """
     classes = {v.cls for v in instances if v.cls != self.empty}
-    return self.merge_values(classes)
+    # Sort the classes so that the same instances always generate the same
+    # merged class type.
+    return self.merge_values(sorted(classes, key=lambda cls: cls.full_name))
 
   def constant_to_var(self, pyval, subst=None, node=None, source_sets=None,
                       discard_concrete_values=False):
@@ -431,8 +435,14 @@ class Converter(utils.ContextWeakrefMixin):
         elif isinstance(t, pytd.NothingType):
           pass
         else:
-          value = self.constant_to_value(
-              abstract_utils.AsInstance(t), subst, node)
+          if isinstance(t, pytd.Annotated):
+            value = self._apply_metadata_annotations(
+                self.constant_to_value(
+                    abstract_utils.AsInstance(t.base_type), subst, node),
+                t.annotations)
+          else:
+            value = self.constant_to_value(
+                abstract_utils.AsInstance(t), subst, node)
           for source_set in source_sets:
             var.AddBinding(value, source_set, node)
       return var
@@ -453,7 +463,7 @@ class Converter(utils.ContextWeakrefMixin):
                                                     discard_concrete_values)
                                for i, v in enumerate(pyval)))
     raise ValueError(
-        "Cannot convert {} to an abstract value".format(pyval.__class__))
+        f"Cannot convert {pyval.__class__} to an abstract value")
 
   def constant_to_value(self, pyval, subst=None, node=None):
     """Like constant_to_var, but convert to an abstract.BaseValue.
@@ -598,6 +608,49 @@ class Converter(utils.ContextWeakrefMixin):
       value = pyval
     return self.constant_to_value(value, subst, self.ctx.root_node)
 
+  def _special_constant_to_value(self, name):
+    """Special-case construction of some pytd values."""
+    if name == "builtins.super":
+      return self.ctx.special_builtins["super"]
+    elif name == "builtins.object":
+      return self.object_type
+    elif name == "types.ModuleType":
+      return self.module_type
+    elif name == "_importlib_modulespec.ModuleType":
+      # Python 3's typeshed uses a stub file indirection to define ModuleType
+      # even though it is exported via types.pyi.
+      return self.module_type
+    elif name == "types.FunctionType":
+      return self.function_type
+    elif name in ("types.NoneType", "_typeshed.NoneType"):
+      # Since types.NoneType is new in 3.10, _typeshed defines its own
+      # equivalent for 3.9 and below:
+      # https://github.com/python/typeshed/blob/3ab3711f427231fe31e856e238bcbc58172ef983/stdlib/_typeshed/__init__.pyi#L240-L247
+      return self.none_type
+    elif name == "types.CodeType":
+      return self.primitive_classes[types.CodeType]
+    else:
+      return None
+
+  def _apply_metadata_annotations(self, typ, annotations):
+    if annotations[0] == "'pytype_metadata'":
+      try:
+        md = metadata.from_string(annotations[1])
+        if md["tag"] == "attr.ib":
+          ret = attr_overlay.AttribInstance.from_metadata(
+              self.ctx, self.ctx.root_node, typ, md)
+          return ret
+        elif md["tag"] == "attr.s":
+          ret = attr_overlay.Attrs.from_metadata(self.ctx, md)
+          return ret
+      except (IndexError, ValueError, TypeError, KeyError):
+        details = "Wrong format for pytype_metadata."
+        self.ctx.errorlog.invalid_annotation(self.ctx.vm.frames,
+                                             annotations[1], details)
+        return typ
+    else:
+      return typ
+
   def _constant_to_value(self, pyval, subst, get_node):
     """Create a BaseValue that represents a python constant.
 
@@ -657,18 +710,9 @@ class Converter(utils.ContextWeakrefMixin):
       mod = self.ctx.loader.import_name(pyval.module_name)
       return self._create_module(mod)
     elif isinstance(pyval, pytd.Class):
-      if pyval.name == "builtins.super":
-        return self.ctx.special_builtins["super"]
-      elif pyval.name == "builtins.object":
-        return self.object_type
-      elif pyval.name == "types.ModuleType":
-        return self.module_type
-      elif pyval.name == "_importlib_modulespec.ModuleType":
-        # Python 3's typeshed uses a stub file indirection to define ModuleType
-        # even though it is exported via types.pyi.
-        return self.module_type
-      elif pyval.name == "types.FunctionType":
-        return self.function_type
+      val = self._special_constant_to_value(pyval.name)
+      if val:
+        return val
       else:
         module, dot, base_name = pyval.name.rpartition(".")
         # typing.TypingContainer intentionally loads the underlying pytd types.
@@ -883,28 +927,12 @@ class Converter(utils.ContextWeakrefMixin):
       return abstract.LiteralClass(value, self.ctx)
     elif isinstance(pyval, pytd.Annotated):
       typ = self.constant_to_value(pyval.base_type, subst, self.ctx.root_node)
-      if pyval.annotations[0] == "'pytype_metadata'":
-        try:
-          md = metadata.from_string(pyval.annotations[1])
-          if md["tag"] == "attr.ib":
-            ret = attr_overlay.AttribInstance.from_metadata(
-                self.ctx, self.ctx.root_node, typ, md)
-            return ret
-          elif md["tag"] == "attr.s":
-            ret = attr_overlay.Attrs.from_metadata(self.ctx, md)
-            return ret
-        except (IndexError, ValueError, TypeError, KeyError):
-          details = "Wrong format for pytype_metadata."
-          self.ctx.errorlog.invalid_annotation(self.ctx.vm.frames,
-                                               pyval.annotations[1], details)
-          return typ
-      else:
-        return typ
+      return self._apply_metadata_annotations(typ, pyval.annotations)
     elif pyval.__class__ is tuple:  # only match raw tuple, not namedtuple/Node
       return self.tuple_to_value([
           self.constant_to_var(item, subst, self.ctx.root_node)
           for i, item in enumerate(pyval)
       ])
     else:
-      raise NotImplementedError("Can't convert constant %s %r" %
-                                (type(pyval), pyval))
+      raise NotImplementedError("Can't convert constant "
+                                f"{type(pyval)} {pyval!r}")

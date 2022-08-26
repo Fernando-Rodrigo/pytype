@@ -177,13 +177,6 @@ class TypedDictTest(test_base.BaseTest):
         "type errors", "{'x': ...}", "expected int", "got str"
     ]})
 
-  def test_functional_constructor(self):
-    err = self.CheckWithErrors("""
-      from typing_extensions import TypedDict
-      A = TypedDict("A", {'x': int, 'y': str})  # not-supported-yet[e]
-    """)
-    self.assertErrorSequences(err, {"e": ["Use the class definition form"]})
-
   def test_total_with_constructor(self):
     self.CheckWithErrors("""
       from typing_extensions import TypedDict
@@ -296,6 +289,62 @@ class TypedDictTest(test_base.BaseTest):
       x: Foo
       f(x)
     """)
+
+  def test_key_existence_check(self):
+    self.Check("""
+      from typing import Union
+      from typing_extensions import TypedDict
+
+      class Foo(TypedDict):
+        a: int
+      class Bar(TypedDict):
+        b: str
+      class Baz(TypedDict):
+        c: Union[Foo, Bar]
+
+      baz: Baz = {'c': {'a': 0}}
+      assert 'a' in baz['c']
+      print(baz['c']['a'])
+    """)
+
+
+class TypedDictFunctionalTest(test_base.BaseTest):
+  """Tests for typing.TypedDict functional constructor."""
+
+  def test_constructor(self):
+    self.CheckWithErrors("""
+      from typing_extensions import TypedDict
+      A = TypedDict("A", {"x": int, "y": str})
+      B = TypedDict("B", "b")  # wrong-arg-types
+      C = TypedDict("C")  # wrong-arg-count
+    """)
+
+  def test_init(self):
+    err = self.CheckWithErrors("""
+      from typing_extensions import TypedDict
+      A = TypedDict("A", {"x": int, "y": str})
+      a = A(x=1, y='2')
+      b = A(x=1, y=2)  # wrong-arg-types[e1]
+      c = A(x=1)  # missing-parameter[e2]
+      d = A(y='1')  # missing-parameter
+      e = A(1, '2')  # missing-parameter
+    """)
+    self.assertErrorSequences(err, {
+        "e1": ["Expected", "(*, x, y: str)", "Actual", "(x, y: int)"],
+        "e2": ["Expected", "(*, x, y)", "Actual", "(x)"]
+    })
+
+  def test_annotation(self):
+    err = self.CheckWithErrors("""
+      from typing_extensions import TypedDict
+      A = TypedDict("A", {"x": int, "y": str})
+      a: A = {'x': '10', 'z': 20}  # annotation-type-mismatch[e]
+    """)
+    self.assertErrorSequences(err, {"e": [
+        "Annotation: A(TypedDict)",
+        "extra keys", "z",
+        "type errors", "{'x': ...}", "expected int", "got str"
+    ]})
 
 
 _SINGLE = """
@@ -444,6 +493,52 @@ class PyiTypedDictTest(test_base.BaseTest):
         import foo
         foo.f(foo.g())
       """)
+
+  def test_nested(self):
+    with self.DepTree([("foo.py", """
+      from typing_extensions import TypedDict
+      class Foo:
+        class Bar(TypedDict):
+          x: str
+    """)]):
+      self.CheckWithErrors("""
+        import foo
+        foo.Foo.Bar(x='')  # ok
+        foo.Foo.Bar(x=0)  # wrong-arg-types
+      """)
+
+  def test_imported_and_nested(self):
+    with self.DepTree([("foo.py", """
+      from typing_extensions import TypedDict
+      class Foo(TypedDict):
+        x: str
+    """)]):
+      ty = self.Infer("""
+        import foo
+        class Bar:
+          Foo = foo.Foo
+      """)
+    self.assertTypesMatchPytd(ty, """
+      import foo
+      class Bar:
+        Foo: type[foo.Foo]
+    """)
+
+  def test_nested_alias(self):
+    ty = self.Infer("""
+      from typing_extensions import TypedDict
+      class Foo(TypedDict):
+        x: str
+      class Bar:
+        Foo = Foo
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import TypedDict
+      class Foo(TypedDict):
+        x: str
+      class Bar:
+        Foo: type[Foo]
+    """)
 
 
 if __name__ == "__main__":

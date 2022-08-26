@@ -12,16 +12,12 @@ locally or within a larger repository.
 
 import collections
 import difflib
-import gzip
 import io
 import itertools
-import os
 import pickle
 import pickletools
 import re
-import sys
 
-from pytype import pytype_source_utils
 from pytype import utils
 from pytype.pytd import printer
 from pytype.pytd import pytd
@@ -29,17 +25,9 @@ from pytype.pytd import pytd_visitors
 from pytype.pytd.parse import parser_constants
 
 
-_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
-_PICKLE_RECURSION_LIMIT_AST = 40000
-PICKLE_EXT = ".pickled"
-
 ANON_PARAM = re.compile(r"_[0-9]+")
 
 _TUPLE_NAMES = ("builtins.tuple", "typing.Tuple")
-
-
-def IsPickle(filename):
-  return os.path.splitext(filename)[1].startswith(PICKLE_EXT)
 
 
 def UnpackUnion(t):
@@ -194,6 +182,13 @@ def Print(ast, multiline_args=False):
   return ast.Visit(printer.PrintVisitor(multiline_args))
 
 
+def MakeTypeAnnotation(ast, multiline_args=False):
+  """Returns a type annotation and any added imports."""
+  vis = printer.PrintVisitor(multiline_args)
+  annotation = ast.Visit(vis)
+  return annotation, vis.imports
+
+
 def CreateModule(name="<empty>", **kwargs):
   module = pytd.TypeDeclUnit(
       name, type_params=(), constants=(), classes=(), functions=(), aliases=())
@@ -223,8 +218,8 @@ def WrapTypeDeclUnit(name, items):
     if isinstance(item, pytd.Function):
       if item.name in functions:
         if item.kind != functions[item.name].kind:
-          raise ValueError("Can't combine %s and %s" % (
-              item.kind, functions[item.name].kind))
+          raise ValueError(f"Can't combine {item.kind} and "
+                           f"{functions[item.name].kind}")
         functions[item.name] = pytd.Function(
             item.name, functions[item.name].signatures + item.signatures,
             item.kind)
@@ -232,20 +227,20 @@ def WrapTypeDeclUnit(name, items):
         functions[item.name] = item
     elif isinstance(item, pytd.Class):
       if item.name in classes:
-        raise NameError("Duplicate top level class: %r" % item.name)
+        raise NameError(f"Duplicate top level class: {item.name!r}")
       classes[item.name] = item
     elif isinstance(item, pytd.Constant):
       constants[item.name].add_type(item.type)
     elif isinstance(item, pytd.Alias):
       if item.name in aliases:
-        raise NameError("Duplicate top level alias or import: %r" % item.name)
+        raise NameError(f"Duplicate top level alias or import: {item.name!r}")
       aliases[item.name] = item
     elif isinstance(item, pytd.TypeParameter):
       if item.name in typevars:
-        raise NameError("Duplicate top level type parameter: %r" % item.name)
+        raise NameError(f"Duplicate top level type parameter: {item.name!r}")
       typevars[item.name] = item
     else:
-      raise ValueError("Invalid top level pytd item: %r" % type(item))
+      raise ValueError(f"Invalid top level pytd item: {type(item)!r}")
 
   categories = {"function": functions, "class": classes, "constant": constants,
                 "alias": aliases, "typevar": typevars}
@@ -339,61 +334,6 @@ class OrderedSet(dict):
     self[item] = None
 
 
-def GetPredefinedFile(stubs_subdir, module, extension=".pytd",
-                      as_package=False):
-  """Get the contents of a predefined PyTD, typically with a file name *.pytd.
-
-  Arguments:
-    stubs_subdir: the directory, typically "builtins" or "stdlib"
-    module: module name (e.g., "sys" or "__builtins__")
-    extension: either ".pytd" or ".py"
-    as_package: try the module as a directory with an __init__ file
-  Returns:
-    The contents of the file
-  Raises:
-    IOError: if file not found
-  """
-  parts = module.split(".")
-  if as_package:
-    parts.append("__init__")
-  mod_path = os.path.join(*parts) + extension
-  path = os.path.join("stubs", stubs_subdir, mod_path)
-  return path, pytype_source_utils.load_text_file(path)
-
-
-def LoadPickle(filename, compress=False, open_function=open):
-  with open_function(filename, "rb") as fi:
-    if compress:
-      with gzip.GzipFile(fileobj=fi) as zfi:
-        # TODO(b/173150871): Remove the disable once the typeshed bug is fixed.
-        return pickle.load(zfi)  # pytype: disable=wrong-arg-types
-    else:
-      return pickle.load(fi)
-
-
-def SavePickle(data, filename=None, compress=False, open_function=open):
-  """Pickle the data."""
-  recursion_limit = sys.getrecursionlimit()
-  sys.setrecursionlimit(_PICKLE_RECURSION_LIMIT_AST)
-  assert not compress or filename, "gzip only supported with a filename"
-  try:
-    if compress:
-      with open_function(filename, mode="wb") as fi:
-        # We blank the filename and set the mtime explicitly to produce
-        # deterministic gzip files.
-        with gzip.GzipFile(filename="", mode="wb",
-                           fileobj=fi, mtime=1.0) as zfi:
-          # TODO(b/173150871): Remove disable once typeshed bug is fixed.
-          pickle.dump(data, zfi, _PICKLE_PROTOCOL)  # pytype: disable=wrong-arg-types
-    elif filename is not None:
-      with open_function(filename, "wb") as fi:
-        pickle.dump(data, fi, _PICKLE_PROTOCOL)
-    else:
-      return pickle.dumps(data, _PICKLE_PROTOCOL)
-  finally:
-    sys.setrecursionlimit(recursion_limit)
-
-
 def ASTeq(ast1, ast2):
   return (ast1.constants == ast2.constants and
           ast1.type_params == ast2.type_params and
@@ -414,11 +354,11 @@ def DiffNamedPickles(named_pickles1, named_pickles2):
   diff = []
   for (name1, pickle1), (name2, pickle2) in zip(named_pickles1, named_pickles2):
     if name1 != name2:
-      diff.append("different ordering of pyi files: %s, %s" % (name1, name2))
+      diff.append(f"different ordering of pyi files: {name1}, {name2}")
     elif pickle1 != pickle2:
       ast1, ast2 = pickle.loads(pickle1), pickle.loads(pickle2)
       if ASTeq(ast1.ast, ast2.ast):
-        diff.append("asts match but pickles differ: %s" % name1)
+        diff.append(f"asts match but pickles differ: {name1}")
         p1 = io.StringIO()
         p2 = io.StringIO()
         pickletools.dis(pickle1, out=p1)
@@ -427,7 +367,7 @@ def DiffNamedPickles(named_pickles1, named_pickles2):
             p1.getvalue().splitlines(),
             p2.getvalue().splitlines()))
       else:
-        diff.append("asts differ: %s" % name1)
+        diff.append(f"asts differ: {name1}")
         diff.append("-" * 50)
         diff.extend(ASTdiff(ast1.ast, ast2.ast))
         diff.append("-" * 50)

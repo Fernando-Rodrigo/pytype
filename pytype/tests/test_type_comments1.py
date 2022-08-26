@@ -1,5 +1,7 @@
 """Tests for type comments."""
 
+import sys
+
 from pytype.tests import test_base
 from pytype.tests import test_utils
 
@@ -287,6 +289,17 @@ class FunctionCommentTest(test_base.BaseTest):
       def g() -> None: ...
     """)
 
+  def test_comment_after_type_comment(self):
+    ty = self.Infer("""
+      def f(x):
+        # type: (...) -> type
+        # comment comment comment
+        return x
+    """)
+    self.assertTypesMatchPytd(ty, """
+      def f(x) -> type: ...
+    """)
+
 
 class AssignmentCommentTest(test_base.BaseTest):
   """Tests for type comments applied to assignments."""
@@ -569,15 +582,6 @@ class AssignmentCommentTest(test_base.BaseTest):
     """)
     self.assertErrorRegexes(errors, {"e": r"Multiple"})
 
-  def test_multiple_directives(self):
-    """We should support multiple directives on one line."""
-    self.Check("""
-      a = list() # type: list[int, str]  # pytype: disable=invalid-annotation
-      b = list() # pytype: disable=invalid-annotation  # type: list[int, str]
-      def foo(x): pass
-      c = foo(a, b.i) # pytype: disable=attribute-error  # pytype: disable=wrong-arg-count
-    """)
-
   def test_nested_comment_alias(self):
     ty = self.Infer("""
       class A: pass
@@ -706,6 +710,25 @@ class AssignmentCommentTest(test_base.BaseTest):
       def f() -> None: ...
       x: int
       def g() -> None: ...
+    """)
+
+  def test_type_comment_on_class(self):
+    # What error is reported differs depending on whether directors.py is using
+    # libcst (host 3.8-) or ast (host 3.9+) and the target version. All we care
+    # about is that the type comment is not ignored.
+    if sys.version_info[:2] >= (3, 9):
+      line1_error = ""
+      line2_error = "  # ignored-type-comment"
+    elif self.python_version >= (3, 8):
+      line1_error = "  # annotation-type-mismatch"
+      line2_error = ""
+    else:
+      line1_error = ""
+      line2_error = "  # annotation-type-mismatch"
+    self.CheckWithErrors(f"""
+      class Foo({line1_error}
+          int):  # type: str{line2_error}
+        pass
     """)
 
 

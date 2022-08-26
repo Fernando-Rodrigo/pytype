@@ -2,13 +2,20 @@
 
 import dataclasses
 
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
 from pytype.abstract import abstract
 from pytype.abstract import abstract_utils
 from pytype.abstract import function
 from pytype.overlays import classgen
 from pytype.pytd import pytd
+
+
+class TypedDictKeyMissing(function.DictKeyMissing):
+
+  def __init__(self, typed_dict: "TypedDict", key: Optional[str]):
+    super().__init__(key)
+    self.typed_dict = typed_dict
 
 
 @dataclasses.dataclass
@@ -29,7 +36,7 @@ class TypedDictProperties:
     return self.keys - self.required
 
   def add(self, k, v, total):
-    self.fields[k] = v
+    self.fields[k] = v  # pylint: disable=unsupported-assignment-operation
     if total:
       self.required.add(k)
 
@@ -48,12 +55,37 @@ class TypedDictBuilder(abstract.PyTDClass):
     pyval = typing_ast.Lookup("typing._TypedDict")
     pyval = pyval.Replace(name="typing.TypedDict")
     super().__init__("TypedDict", pyval, ctx)
+    # Signature for the functional constructor
+    fn = typing_ast.Lookup("typing._TypedDictFunction")
+    fn = fn.Replace(name="typing.TypedDict")
+    sig, = fn.signatures
+    self.fn_sig = function.Signature.from_pytd(
+        self.ctx, "typing.TypedDict", sig)
 
-  def call(self, node, *args):
-    details = ("Use the class definition form of TypedDict instead.")
-    self.ctx.errorlog.not_supported_yet(
-        self.ctx.vm.frames, "TypedDict functional constructor", details)
-    return node, self.ctx.new_unsolvable(node)
+  def call(self, node, _, args):
+    """Call the functional constructor."""
+    props = self._extract_args(args)
+    cls = TypedDictClass(props, self, self.ctx)
+    cls_var = cls.to_variable(node)
+    return node, cls_var
+
+  def _extract_param(self, args, pos, name, pyval_type, typ):
+    var = args.posargs[pos]
+    try:
+      return abstract_utils.get_atomic_python_constant(var, pyval_type)
+    except abstract_utils.ConversionError as e:
+      bad = abstract_utils.BadType(name, typ)
+      raise function.WrongArgTypes(self.fn_sig, args, self.ctx, bad) from e
+
+  def _extract_args(self, args):
+    if len(args.posargs) != 2:
+      raise function.WrongArgCount(self.fn_sig, args, self.ctx)
+    name = self._extract_param(args, 0, "name", str, self.ctx.convert.str_type)
+    fields = self._extract_param(
+        args, 1, "fields", dict, self.ctx.convert.dict_type)
+    props = TypedDictProperties(
+        name=name, fields=fields, required=set(fields.keys()), total=True)
+    return props
 
   def _validate_bases(self, cls_name, bases):
     """Check that all base classes are valid."""
@@ -220,30 +252,25 @@ class TypedDict(abstract.Dict):
 
   def _check_str_key(self, name):
     if name not in self.fields:
-      self.ctx.errorlog.typed_dict_error(self.ctx.vm.frames, self, name)
-      return False
-    return True
+      raise TypedDictKeyMissing(self, name)
 
   def _check_str_key_value(self, node, name, value_var):
-    if not self._check_str_key(name):
-      return
+    self._check_str_key(name)
     typ = abstract_utils.get_atomic_value(self.fields[name])
-    bad = self.ctx.matcher(node).bad_matches(value_var, typ)
-    for view, error_details in bad:
-      binding = view[value_var]
+    bad, _ = self.ctx.matcher(node).bad_matches(value_var, typ)
+    for match in bad:
       self.ctx.errorlog.annotation_type_mismatch(
-          self.ctx.vm.frames, typ, binding, name, error_details,
-          typed_dict=self
+          self.ctx.vm.frames, match.expected.typ, match.actual_binding, name,
+          match.error_details, typed_dict=self
       )
 
   def _check_key(self, name_var):
     """Check that key is in the typed dict."""
     try:
       name = abstract_utils.get_atomic_python_constant(name_var, str)
-    except abstract_utils.ConversionError:
-      self.ctx.errorlog.typed_dict_error(self.ctx.vm.frames, self, name=None)
-      return False
-    return self._check_str_key(name)
+    except abstract_utils.ConversionError as e:
+      raise TypedDictKeyMissing(self, None) from e
+    self._check_str_key(name)
 
   def _check_value(self, node, name_var, value_var):
     """Check that value has the right type."""
@@ -254,13 +281,12 @@ class TypedDict(abstract.Dict):
   def getitem_slot(self, node, name_var):
     # A typed dict getitem should have a concrete string arg. If we have a var
     # with multiple bindings just fall back to Any.
-    if not self._check_key(name_var):
-      return node, self.ctx.new_unsolvable(node)
+    self._check_key(name_var)
     return super().getitem_slot(node, name_var)
 
   def setitem_slot(self, node, name_var, value_var):
-    if self._check_key(name_var):
-      self._check_value(node, name_var, value_var)
+    self._check_key(name_var)
+    self._check_value(node, name_var, value_var)
     return super().setitem_slot(node, name_var, value_var)
 
   def set_str_item(self, node, name, value_var):

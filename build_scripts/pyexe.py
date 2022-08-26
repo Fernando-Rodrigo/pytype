@@ -29,6 +29,16 @@ EXE_TEMPLATE = """#! /usr/bin/env python
 import os
 import sys
 
+def add_paths(paths: str):
+    sys.path = paths + sys.path
+
+    python_path_key = 'PYTHONPATH'
+    old_value = os.environ.get(python_path_key, '')
+    paths_string = os.pathsep.join(paths)
+    new_value = paths_string if not old_value else paths_string + os.pathsep + old_value
+    os.environ[python_path_key] = new_value
+
+
 {path_adjustment}
 
 {env_adjustment}
@@ -62,20 +72,20 @@ def parse_args():
 def main():
   options = parse_args()
 
-  path_adjustment = "sys.path = [%s] + sys.path" % ",".join([
-      "'%s'" % path for path in options.path])
+  path_adjustment = "add_paths([%s])" % ",".join([
+        "'%s'" % path for path in options.path])
 
   env_adjustment = ""
   for env in options.env:
     var, value = env.split("=")
-    env_adjustment += "os.environ['%s'] = '%s'\n" % (var, value)
+    env_adjustment += f"os.environ['{var}'] = '{value}'\n"
 
   if "." in options.main_module:
     pkg, modname = options.main_module.rsplit(".", 1)
-    import_stmt = "from %s import %s" % (pkg, modname)
+    import_stmt = f"from {pkg} import {modname}"
   else:
     modname = options.main_module
-    import_stmt = "import %s" % options.main_module
+    import_stmt = f"import {options.main_module}"
 
   with open(options.exe_path, "w") as target:
     text = EXE_TEMPLATE.format(

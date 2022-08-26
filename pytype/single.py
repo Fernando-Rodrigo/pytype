@@ -16,7 +16,7 @@ from pytype import io
 from pytype import load_pytd
 from pytype import metrics
 from pytype import utils
-from pytype.pytd import typeshed
+from pytype.imports import typeshed
 
 
 log = logging.getLogger(__name__)
@@ -76,7 +76,8 @@ def main():
     with options.open_function(options.exec_log, "w") as f:
       f.write(" ".join(sys.argv))
 
-  if options.timeout is not None:
+  # TODO(mdemello): timeout is temporarily unavailable under win32
+  if options.timeout is not None and sys.platform != "win32":
     signal.alarm(options.timeout)
 
   with _ProfileContext(options.profile):

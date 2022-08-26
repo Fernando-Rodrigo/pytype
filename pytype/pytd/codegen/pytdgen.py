@@ -9,7 +9,7 @@ _STRING_TYPES = ("str", "bytes", "unicode")
 
 
 # Type aliases
-Parameters = Tuple[pytd.Type, ...]
+_ParametersType = Tuple[pytd.Type, ...]
 
 
 def pytd_list(typ: str) -> pytd.Type:
@@ -35,7 +35,7 @@ def is_none(t) -> bool:
 
 def heterogeneous_tuple(
     base_type: pytd.NamedType,
-    parameters: Parameters
+    parameters: _ParametersType
 ) -> pytd.Type:
   return pytd.TupleType(base_type=base_type, parameters=parameters)
 
@@ -46,13 +46,13 @@ def pytd_type(value: pytd.Type) -> pytd.Type:
 
 def pytd_callable(
     base_type: pytd.NamedType,
-    parameters: Parameters
+    parameters: _ParametersType
 ) -> pytd.Type:
   """Create a pytd.CallableType."""
   if isinstance(parameters[0], list):
     if len(parameters) > 2:
       raise TypeError(
-          "Expected 2 parameters to Callable, got %d" % len(parameters))
+          f"Expected 2 parameters to Callable, got {len(parameters)}")
     if len(parameters) == 1:
       # We're usually happy to treat omitted parameters as "Any", but we
       # need a return type for CallableType, or we wouldn't know whether the

@@ -1,5 +1,7 @@
 """Custom implementations of builtin types."""
 
+import sys
+
 from pytype.abstract import abstract
 from pytype.abstract import abstract_utils
 from pytype.abstract import class_mixin
@@ -341,10 +343,10 @@ class BuiltinClass(abstract.PyTDClass):
 
   def __init__(self, ctx, name, module="builtins"):
     if module == "builtins":
-      pytd_cls = ctx.loader.lookup_builtin("builtins.%s" % name)
+      pytd_cls = ctx.loader.lookup_builtin(f"builtins.{name}")
     else:
       ast = ctx.loader.import_name(module)
-      pytd_cls = ast.Lookup("%s.%s" % (module, name))
+      pytd_cls = ast.Lookup(f"{module}.{name}")
     super().__init__(name, pytd_cls, ctx)
     self.module = module
 
@@ -438,7 +440,7 @@ class Super(BuiltinClass):
     for cls in cls_var.bindings:
       if not isinstance(cls.data, (abstract.Class,
                                    abstract.AMBIGUOUS_OR_EMPTY)):
-        bad = function.BadParam(name="cls", expected=self.ctx.convert.type_type)
+        bad = abstract_utils.BadType(name="cls", typ=self.ctx.convert.type_type)
         raise function.WrongArgTypes(
             self._SIGNATURE, args, self.ctx, bad_param=bad)
       for obj in super_objects:
@@ -596,8 +598,31 @@ class PropertyInstance(abstract.Function, mixin.HasSlots):
     self.bound_class = abstract.BoundFunction
 
   def fget_slot(self, node, obj, objtype):
-    return function.call_function(self.ctx, node, self.fget,
-                                  function.Args((obj,)))
+    obj_val = abstract_utils.get_atomic_value(
+        obj, default=self.ctx.convert.unsolvable)
+    set_self_annot_managers = []
+    t = abstract_utils.get_generic_type(obj_val)
+    if t and any(self in member.data for member in t.members.values()):
+      # This property is defined on a generic class. We need to annotate self
+      # with a parameterized type for the property return type to be computed
+      # properly, e.g.:
+      #   @property
+      #   def x(self) -> T: ...
+      # is changed to:
+      #   @property
+      #   def x(self: Foo[T]) -> T: ...
+      for f in self.fget.data:
+        if f.should_replace_self_annot():
+          set_self_annot_managers.append(f.set_self_annot(t))
+    for manager in set_self_annot_managers:
+      manager.__enter__()
+    try:
+      return function.call_function(self.ctx, node, self.fget,
+                                    function.Args((obj,)))
+    finally:
+      exc_info = sys.exc_info()
+      for manager in set_self_annot_managers:
+        manager.__exit__(*exc_info)
 
   def fset_slot(self, node, obj, value):
     return function.call_function(self.ctx, node, self.fset,
@@ -638,6 +663,21 @@ class Property(PropertyTemplate):
                                   **property_args).to_variable(node)
 
 
+def _check_method_decorator_arg(fn_var, name, ctx):
+  """Check that @classmethod or @staticmethod are applied to a function."""
+  for d in fn_var.data:
+    try:
+      _ = function.get_signatures(d)
+    except NotImplementedError:
+      # We are wrapping something that is not a function in a method decorator.
+      # TODO(mdemello): The error line is the function definition rather than
+      # the line with `@classmethod` or `@staticmethod`
+      details = f"@{name} applied to something that is not a function."
+      ctx.errorlog.not_callable(ctx.vm.frames, d, details)
+      return False
+  return True
+
+
 class StaticMethodInstance(abstract.Function, mixin.HasSlots):
   """StaticMethod instance (constructed by StaticMethod.call())."""
 
@@ -668,6 +708,8 @@ class StaticMethod(BuiltinClass):
     if len(args.posargs) != 1:
       raise function.WrongArgCount(self._SIGNATURE, args, self.ctx)
     arg = args.posargs[0]
+    if not _check_method_decorator_arg(arg, "staticmethod", self.ctx):
+      return node, self.ctx.new_unsolvable(node)
     return node, StaticMethodInstance(self.ctx, self, arg).to_variable(node)
 
 
@@ -705,6 +747,8 @@ class ClassMethod(BuiltinClass):
     if len(args.posargs) != 1:
       raise function.WrongArgCount(self._SIGNATURE, args, self.ctx)
     arg = args.posargs[0]
+    if not _check_method_decorator_arg(arg, "classmethod", self.ctx):
+      return node, self.ctx.new_unsolvable(node)
     for d in arg.data:
       d.is_classmethod = True
       d.is_attribute_of_class = True

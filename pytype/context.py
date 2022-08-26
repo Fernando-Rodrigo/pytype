@@ -17,7 +17,6 @@ from pytype import tracer_vm
 from pytype import vm_utils
 from pytype.abstract import abstract
 from pytype.abstract import abstract_utils
-from pytype.abstract import class_mixin
 from pytype.abstract import function
 from pytype.typegraph import cfg
 from pytype.typegraph import cfg_utils
@@ -96,7 +95,7 @@ class Context:
     self.recursion_allowed = False
     # Map from classes to maps from names of the instance methods
     # of the class to their signatures.
-    self.method_signature_map: Dict[class_mixin.Class,
+    self.method_signature_map: Dict[abstract.Class,
                                     Dict[str, function.Signature]] = {}
 
   def matcher(self, node):
@@ -164,8 +163,8 @@ class Context:
         typ, ("typing.ClassVar", "dataclasses.InitVar"))
     if contained_type:
       typ = contained_type
-    bad = self.matcher(node).bad_matches(value, typ)
-    for view, error_details in bad:
-      binding = view[value]
+    bad, _ = self.matcher(node).bad_matches(value, typ)
+    for match in bad:
       self.errorlog.annotation_type_mismatch(
-          stack, typ, binding, name, error_details, details)
+          stack, match.expected.typ, match.actual_binding, name,
+          match.error_details, details)

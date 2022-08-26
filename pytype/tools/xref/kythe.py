@@ -15,6 +15,7 @@ class Args:
   root: str
   corpus: str
   path: str
+  skip_stdlib: bool = False
 
 
 # Kythe nodes
@@ -52,10 +53,12 @@ class Kythe:
       self.root = args.root
       self.corpus = args.corpus
       self.path = args.path or source.filename
+      self.skip_stdlib = args.skip_stdlib
     else:
       self.root = ""
       self.corpus = ""
       self.path = source.filename
+      self.skip_stdlib = False
     self.entries = []
     self._seen_entries = set()
     self.file_vname = self._add_file(source.text)
@@ -90,12 +93,12 @@ class Kythe:
     self._seen_entries.add(entry)
     self.entries.append(entry)
 
-  def vname(self, signature, filepath=None):
+  def vname(self, signature, filepath=None, root=None):
     return VName(
         signature=signature,
         path=filepath or self.path,
         language="python",
-        root=self.root,
+        root=root or self.root,
         corpus=self.corpus)
 
   def stdlib_vname(self, signature, filepath=None):
@@ -134,7 +137,6 @@ class Kythe:
     self.add_fact(vname, "node/kind", "anchor")
     self.add_fact(vname, "loc/start", str(start))
     self.add_fact(vname, "loc/end", str(end))
-    self.add_edge(vname, "childof", self.file_vname)
     return vname
 
 
@@ -166,8 +168,9 @@ def _process_deflocs(kythe: Kythe, index: indexer.Indexer):
         pass
       else:
         alias_vname = _make_defn_vname(kythe, index, alias)
-        kythe.add_edge(
-            source=defn_vname, target=alias_vname, edge_name="aliases")
+        if alias_vname:
+          kythe.add_edge(
+              source=defn_vname, target=alias_vname, edge_name="aliases")
 
       # Emit a docstring if we have one.
       doc = defn.doc
@@ -202,6 +205,7 @@ def _make_defn_vname(kythe, index, defn):
   if isinstance(defn, indexer.Remote):
     remote = defn.module
     if remote in index.resolved_modules:
+      is_generated = "generated" in index.resolved_modules[remote].metadata
       if remote in index.imports:
         # The canonical path from the imports_map is the best bet for
         # module->filepath translation.
@@ -216,8 +220,14 @@ def _make_defn_vname(kythe, index, defn):
       else:
         sig = "module." + defn.name
       if path.startswith("pytd:"):
+        if kythe.skip_stdlib:
+          # Skip builtin and stdlib imports since we don't have a filepath.
+          # TODO(mdemello): Link to the typeshed definition
+          return None
         return kythe.stdlib_vname(
             sig, "pytd:" + index.resolved_modules[remote].module_name)
+      elif is_generated:
+        return kythe.vname(sig, path, root="root/genfiles")
       else:
         return kythe.vname(sig, path)
     else:
@@ -246,6 +256,15 @@ def _process_links(kythe: Kythe, index: indexer.Indexer):
     kythe.add_edge(source=vname, target=target, edge_name=edge_name)
 
 
+def _process_childof(kythe: Kythe, index: indexer.Indexer):
+  """Generate kythe edges for childof relationships."""
+
+  for child, parent in index.childof:
+    source = _make_defn_vname(kythe, index, child)
+    target = _make_defn_vname(kythe, index, parent)
+    kythe.add_edge(source=source, target=target, edge_name="childof")
+
+
 def _process_calls(kythe, index):
   """Generate kythe edges for function calls."""
 
@@ -268,8 +287,9 @@ def _process_calls(kythe, index):
     if call_defn:
       target = _make_defn_vname(kythe, index, call_defn)
       if target:
-        start, end = index.get_ref_bounds(call_ref)
-        anchor_vname = kythe.anchor_vname(start, end)
+        start, _ = index.get_ref_bounds(call_ref)
+        end = index.source.get_offset(call.end_location)
+        anchor_vname = kythe.add_anchor(start, end)
         kythe.add_edge(source=anchor_vname, target=target, edge_name="ref/call")
         # The call is a child of the enclosing function/class (this lets us
         # generate call graphs).
@@ -290,5 +310,6 @@ def generate_graph(index, kythe_args):
   _process_deflocs(kythe, index)
   _process_params(kythe, index)
   _process_links(kythe, index)
+  _process_childof(kythe, index)
   _process_calls(kythe, index)
   return kythe

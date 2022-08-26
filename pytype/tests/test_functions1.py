@@ -1,117 +1,7 @@
 """Test functions."""
 
-from pytype import file_utils
 from pytype.tests import test_base
-
-
-class TestClosures(test_base.BaseTest):
-  """Tests for closures."""
-
-  def test_closures(self):
-    self.Check("""
-      def make_adder(x):
-        def add(y):
-          return x+y
-        return add
-      a = make_adder(10)
-      print(a(7))
-      assert a(7) == 17
-      """)
-
-  def test_closures_store_deref(self):
-    self.Check("""
-      def make_adder(x):
-        z = x+1
-        def add(y):
-          return x+y+z
-        return add
-      a = make_adder(10)
-      print(a(7))
-      assert a(7) == 28
-      """)
-
-  def test_empty_vs_deleted(self):
-    self.Check("""
-      import collections
-      Foo = collections.namedtuple('Foo', 'x')
-      def f():
-        (x,) = Foo(10)  # x gets set to abstract.Empty here.
-        def g():
-          return x  # Should not raise a name-error
-    """)
-
-  def test_closures_in_loop(self):
-    self.Check("""
-      def make_fns(x):
-        fns = []
-        for i in range(x):
-          fns.append(lambda i=i: i)
-        return fns
-      fns = make_fns(3)
-      for f in fns:
-        print(f())
-      assert (fns[0](), fns[1](), fns[2]()) == (0, 1, 2)
-      """)
-
-  def test_closures_with_defaults(self):
-    self.Check("""
-      def make_adder(x, y=13, z=43):
-        def add(q, r=11):
-          return x+y+z+q+r
-        return add
-      a = make_adder(10, 17)
-      print(a(7))
-      assert a(7) == 88
-      """)
-
-  def test_deep_closures(self):
-    self.Check("""
-      def f1(a):
-        b = 2*a
-        def f2(c):
-          d = 2*c
-          def f3(e):
-            f = 2*e
-            def f4(g):
-              h = 2*g
-              return a+b+c+d+e+f+g+h
-            return f4
-          return f3
-        return f2
-      answer = f1(3)(4)(5)(6)
-      print(answer)
-      assert answer == 54
-      """)
-
-  def test_closure(self):
-    ty = self.Infer("""
-      import ctypes
-      f = 0
-      def e():
-        global f
-        s = 0
-        f = (lambda: ctypes.foo(s))  # ctypes.foo doesn't exist
-        return f()
-      e()
-    """, report_errors=False)
-    self.assertHasReturnType(ty.Lookup("e"), self.anything)
-    self.assertTrue(ty.Lookup("f"))
-
-  def test_recursion(self):
-    self.Check("""
-      def f(x):
-        def g(y):
-          f({x: y})
-    """)
-
-  def test_unbound_closure_variable(self):
-    self.CheckWithErrors("""
-      def foo():
-        def bar():
-          return tuple(xs)  # name-error
-        xs = bar()
-      foo()
-    """)
+from pytype.tests import test_utils
 
 
 class TestGenerators(test_base.BaseTest):
@@ -210,7 +100,7 @@ class PreciseReturnTest(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e": r"str.*int"})
 
   def test_param_return(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import TypeVar
         T = TypeVar("T")
@@ -372,7 +262,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_wraps(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("myfunctools.pyi", """
         from typing import Any, Callable, Sequence
         from typing import Any
@@ -459,7 +349,7 @@ class TestFunctions(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e": r"foo.*max"})
 
   def test_multiple_signatures_with_type_parameter(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import List, TypeVar
         T = TypeVar("T")
@@ -478,7 +368,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_multiple_signatures_with_multiple_type_parameter(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import List, Tuple, TypeVar
         T = TypeVar("T")
@@ -498,7 +388,7 @@ class TestFunctions(test_base.BaseTest):
 
   def test_unknown_single_signature(self):
     # Test that the right signature is picked in the presence of an unknown
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import List, TypeVar
         T = TypeVar("T")
@@ -517,7 +407,7 @@ class TestFunctions(test_base.BaseTest):
     """)
 
   def test_unknown_with_solved_type_parameter(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import List, TypeVar
         T = TypeVar("T")
@@ -536,7 +426,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_unknown_with_extra_information(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import List, TypeVar
         T = TypeVar("T")
@@ -563,7 +453,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_type_parameter_in_return(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Generic, TypeVar
         T = TypeVar("T")
@@ -583,7 +473,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_multiple_signatures(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: str) -> float: ...
         def f(x: int, y: bool) -> int: ...
@@ -598,7 +488,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_multiple_signatures_with_unknown(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(arg1: str) -> float: ...
         def f(arg2: int) -> bool: ...
@@ -615,7 +505,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_multiple_signatures_with_optional_arg(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: str) -> int: ...
         def f(*args) -> float: ...
@@ -632,7 +522,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_multiple_signatures_with_kwarg(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(*, y: int) -> bool: ...
         def f(y: str) -> float: ...
@@ -684,7 +574,7 @@ class TestFunctions(test_base.BaseTest):
     """)
 
   def test_function_class(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f() -> None: ...
       """)
@@ -707,7 +597,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_type_parameter_visibility(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Tuple, TypeVar, Union
         T = TypeVar("T")
@@ -725,7 +615,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_pytd_function_in_class(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def bar(): ...
       """)
@@ -776,7 +666,7 @@ class TestFunctions(test_base.BaseTest):
       """)
 
   def test_set_defaults_non_new(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         def b(x: int, y: int, z: int): ...
         """)
@@ -883,7 +773,7 @@ class TestFunctions(test_base.BaseTest):
     """)
 
   def test_pyi_starargs(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: str, *args) -> None: ...
       """)
@@ -893,7 +783,7 @@ class TestFunctions(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_starargs_matching_pyi_posargs(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: int, y: int, z: int) -> None: ...
       """)
@@ -906,7 +796,7 @@ class TestFunctions(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_starargs_forwarding(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(x: int) -> None: ...
       """)
@@ -937,7 +827,7 @@ class TestFunctions(test_base.BaseTest):
     """)
 
   def test_preserve_return_union(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Union
         def f(x: int) -> Union[int, str]: ...

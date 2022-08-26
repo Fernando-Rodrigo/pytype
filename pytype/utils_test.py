@@ -1,5 +1,4 @@
 """Tests for utils.py."""
-
 from pytype import utils
 
 import unittest
@@ -77,20 +76,6 @@ class UtilsTest(unittest.TestCase):
   def _validate_version_helper(self, python_version):
     with self.assertRaises(utils.UsageError):
       utils.validate_version(python_version)
-
-  def test_parse_interpreter_version(self):
-    test_cases = (
-        ("Python 3.8.3", (3, 8)),
-        ("Python 3.8.4 :: Something custom (64-bit)", (3, 8)),
-        ("[OS-Y 64-bit] Python 3.9.1", (3, 9)),
-    )
-    for version_str, expected in test_cases:
-      self.assertEqual(expected, utils.parse_exe_version_string(version_str))
-
-  def test_get_python_exe_version(self):
-    version = utils.get_python_exe_version(["python"])
-    self.assertIsInstance(version, tuple)
-    self.assertEqual(len(version), 2)
 
 
 def _make_tuple(x):

@@ -9,6 +9,7 @@ py_library(
     .conditions
     .definitions
     .function
+    .init
     .metadata
     .modules
     .types
@@ -91,6 +92,13 @@ py_library(
 
 py_library(
   NAME
+    init
+  SRCS
+    __init__.py
+)
+
+py_library(
+  NAME
     metadata
   SRCS
     metadata.py
@@ -118,7 +126,6 @@ py_library(
   DEPS
     pytype.utils
     pytype.pytd.pytd_for_parser
-    pytype.pytd.parse.parse
 )
 
 py_library(
@@ -177,7 +184,7 @@ py_test(
     entire_file_parser_test.py
   DEPS
     .parser_test_base
-    pytype.pytd.pytd
+    pytype.imports.imports
 )
 
 py_test(

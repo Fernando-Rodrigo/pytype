@@ -1,8 +1,8 @@
 """Tests for TypeVar."""
 
-from pytype import file_utils
 from pytype.pytd import pytd_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class TypeVarTest(test_base.BaseTest):
@@ -63,7 +63,7 @@ class TypeVarTest(test_base.BaseTest):
     """)
 
   def test_import_typevar_name_change(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import TypeVar
         T = TypeVar("T")
@@ -136,7 +136,7 @@ class TypeVarTest(test_base.BaseTest):
       f4("hello", "world", "domination")  # ok
     """)
     self.assertErrorRegexes(errors, {
-        "e1": r"List\[S\].*set", "e2": r"str.*int", "e3": r"bool.*int",
+        "e1": r"list.*set", "e2": r"str.*int", "e3": r"bool.*int",
         "e4": r"List\[bool\].*List\[Union\[float, int\]\]"})
 
   def test_use_constraints(self):
@@ -327,7 +327,7 @@ class TypeVarTest(test_base.BaseTest):
       def f() -> Optional[T]:
         return 42 if __random__ else None  # bad-return-type[e]
     """, deep=True)
-    self.assertErrorRegexes(errors, {"e": r"Optional\[T\].*int"})
+    self.assertErrorRegexes(errors, {"e": r"Optional\[str\].*int"})
 
   def test_unicode_literals(self):
     ty = self.Infer("""
@@ -394,13 +394,12 @@ class TypeVarTest(test_base.BaseTest):
           def foo(self, foo: T) -> None:
               self._foo = foo
     """)
-    # types inferred as Any due to b/123835298
     self.assertTypesMatchPytd(ty, """
       from typing import TypeVar, Generic, Any, Annotated
       T = TypeVar('T')
       class A(Generic[T]):
           _foo: T
-          foo: Annotated[Any, 'property']
+          foo: Annotated[T, 'property']
           def __init__(self, foo: T) -> None:
             self = A[T]
     """)
@@ -639,7 +638,7 @@ class GenericTypeAliasTest(test_base.BaseTest):
       X = List[T1]
       def f(x: List[T2]) -> T2: ...
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo_ty))
       ty = self.Infer("""
         import foo
@@ -669,7 +668,7 @@ class GenericTypeAliasTest(test_base.BaseTest):
       X = List[T]
       def f(x: List[int]) -> int: ...
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo_ty))
       ty = self.Infer("""
         import foo
@@ -719,7 +718,7 @@ class GenericTypeAliasTest(test_base.BaseTest):
       from typing import TypeVar
       T = TypeVar('T')
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo))
       bar = self.Infer("""
         import foo
@@ -853,7 +852,7 @@ class GenericTypeAliasTest(test_base.BaseTest):
       T = TypeVar('T')
       X = Optional[T]
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo))
       ty = self.Infer("""
         import foo
@@ -914,7 +913,7 @@ class TypeVarTestPy3(test_base.BaseTest):
   """Tests for TypeVar in Python 3."""
 
   def test_use_constraints_from_pyi(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import AnyStr, TypeVar
         T = TypeVar("T", int, float)

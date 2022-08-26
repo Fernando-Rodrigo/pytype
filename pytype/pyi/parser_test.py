@@ -530,7 +530,7 @@ class ParserTest(parser_test_base.ParserTestBase):
     """, """
       from typing import List
 
-      __all__: List[str]
+      __all__: List[str] = ...
     """)
 
   def test_invalid_constructor(self):
@@ -1259,13 +1259,9 @@ class ClassTest(parser_test_base.ParserTestBase):
     self.check_error("""
       class Foo(badkeyword=Meta): ...
       """, 1, "Unexpected classdef kwarg 'badkeyword'")
-    if sys.version_info[:2] >= (3, 10):
-      expected_msg = "expected ':'"
-    else:
-      expected_msg = "positional argument follows keyword argument"
     self.check_error("""
       class Foo(metaclass=Meta, Bar): ...
-      """, 1, expected_msg)
+      """, 1, "positional argument follows keyword argument")
 
   def test_shadow_pep484(self):
     self.check("""
@@ -1380,7 +1376,7 @@ class ClassTest(parser_test_base.ParserTestBase):
 
       T = TypeVar('T')
 
-      class Foo(Protocol, Generic[T]): ...
+      class Foo(Generic[T], Protocol): ...
     """)
 
   def test_typing_extensions_parameterized_protocol(self):
@@ -1398,7 +1394,7 @@ class ClassTest(parser_test_base.ParserTestBase):
 
       T = TypeVar('T')
 
-      class Foo(typing.Protocol, Generic[T]): ...
+      class Foo(Generic[T], typing.Protocol): ...
     """)
 
   def test_bad_typevar_in_mutation(self):
@@ -1679,16 +1675,16 @@ class ConditionTest(parser_test_base.ParserTestBase):
     out = "x: int" if expected else ""
     if "version" not in kwargs:
       kwargs["version"] = (3, 6, 5)
-    self.check("""
-      if %s:
+    self.check(f"""
+      if {condition}:
         x = ...  # type: int
-      """ % condition, out, **kwargs)
+      """, out, **kwargs)
 
   def check_cond_error(self, condition, message):
-    self.check_error("""
-      if %s:
+    self.check_error(f"""
+      if {condition}:
         x = ...  # type: int
-      """ % condition, 1, message)
+      """, 1, message)
 
   def test_version_eq(self):
     self.check_cond("sys.version_info == (3, 6, 4)", False)
@@ -2982,6 +2978,47 @@ class TypeGuardTest(parser_test_base.ParserTestBase):
 
       def f(x: List[object]) -> bool: ...
     """)
+
+
+class AllTest(parser_test_base.ParserTestBase):
+
+  def check(self, src, expected):
+    tree = self.parse(src)
+    all_ = [x for x in tree.constants if x.name == "__all__"]
+    pyval = all_[0].value if all_ else None
+    self.assertEqual(pyval, expected)
+
+  def test_basic(self):
+    self.check("""
+      __all__ = ["f", "g"]
+    """, ("f", "g"))
+
+  def test_tuple(self):
+    self.check("""
+    __all__ = ("f", "g")
+    """, ("f", "g"))
+
+  def test_augment(self):
+    self.check("""
+      __all__ = ["f", "g"]
+      __all__ += ["h"]
+    """, ("f", "g", "h"))
+
+  def test_if(self):
+    self.check("""
+      __all__ = ["f", "g"]
+      if sys.version_info > (3, 6, 0):
+        __all__ += ["h"]
+    """, ("f", "g", "h"))
+
+  def test_else(self):
+    self.check("""
+      __all__ = ["f", "g"]
+      if sys.version_info < (3, 6, 0):
+        __all__ += ["e"]
+      else:
+        __all__ += ["h"]
+    """, ("f", "g", "h"))
 
 
 if __name__ == "__main__":

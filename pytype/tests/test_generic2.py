@@ -1,8 +1,8 @@
 """Tests for handling GenericType."""
 
-from pytype import file_utils
 from pytype.pytd import pytd_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class GenericBasicTest(test_base.BaseTest):
@@ -100,7 +100,7 @@ class GenericBasicTest(test_base.BaseTest):
     self.assertErrorRegexes(errors, {"e": r"Cannot inherit.*plain Generic"})
 
   def test_generic_with_dup_type_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import Generic, TypeVar
 
@@ -113,7 +113,7 @@ class GenericBasicTest(test_base.BaseTest):
       self.assertErrorRegexes(errors, {"e": r"Duplicate.*T.*a.A"})
 
   def test_multi_generic_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import Generic, TypeVar
 
@@ -128,7 +128,7 @@ class GenericBasicTest(test_base.BaseTest):
           errors, {"e": r"Cannot inherit.*Generic.*multiple times"})
 
   def test_generic_with_type_miss_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import Generic, TypeVar, Dict
 
@@ -291,7 +291,7 @@ class GenericBasicTest(test_base.BaseTest):
         errors, {"e": r"V.*appears only once in the function signature"})
 
   def test_type_parameter_without_substitution(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("base.pyi", """
         from typing import Generic, Type, TypeVar
 
@@ -310,7 +310,7 @@ class GenericBasicTest(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_pytd_class_instantiation(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import Generic, TypeVar
         T = TypeVar("T")
@@ -360,7 +360,7 @@ class GenericBasicTest(test_base.BaseTest):
         errors, {"e1": r"int.*str", "e2": r"int.*str", "e3": r"int.*str"})
 
   def test_func_match_for_pytd_class_error(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import TypeVar, Generic
 
@@ -480,7 +480,7 @@ class GenericBasicTest(test_base.BaseTest):
 
   def test_self_type_parameter(self):
     # The purpose is to verify there is no infinite recursion
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import Sequence, Typing, Generic
 
@@ -765,7 +765,7 @@ class GenericBasicTest(test_base.BaseTest):
 
   def test_generic_substitution(self):
     # Tests a complicated use of generics distilled from real user code.
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Any, Dict, Generic, List, Optional, Protocol, TypeVar
 
@@ -856,12 +856,105 @@ class GenericBasicTest(test_base.BaseTest):
           return Box(f(self.x))
     """)
 
+  def test_property(self):
+    self.Check("""
+      from typing import Generic, TypeVar, Union
+      T = TypeVar('T', bound=Union[int, str])
+      class Foo(Generic[T]):
+        @property
+        def foo(self) -> T:
+          return __any_object__
+      x: Foo[int]
+      assert_type(x.foo, int)
+    """)
+
+  def test_property_with_init_parameter(self):
+    self.Check("""
+      from typing import Generic, TypeVar, Union
+      T = TypeVar('T', bound=Union[int, str])
+      class Foo(Generic[T]):
+        def __init__(self, foo: T):
+          self._foo = foo
+        @property
+        def foo(self) -> T:
+          return self._foo
+      x = Foo(0)
+      assert_type(x.foo, int)
+    """)
+
+  def test_property_with_inheritance(self):
+    self.Check("""
+      from typing import Generic, TypeVar, Union
+      T = TypeVar('T', bound=Union[int, str])
+      class Foo(Generic[T]):
+        def __init__(self, foo: T):
+          self._foo = foo
+        @property
+        def foo(self) -> T:
+          return self._foo
+      class Bar(Foo[int]):
+        pass
+      x: Bar
+      assert_type(x.foo, int)
+    """)
+
+  def test_pyi_property(self):
+    with self.DepTree([("foo.py", """
+        from typing import Generic, TypeVar, Union
+        T = TypeVar('T', bound=Union[int, str])
+        class Foo(Generic[T]):
+          @property
+          def foo(self) -> T:
+            return __any_object__
+    """)]):
+      self.Check("""
+        import foo
+        x: foo.Foo[int]
+        assert_type(x.foo, int)
+      """)
+
+  def test_pyi_property_with_inheritance(self):
+    with self.DepTree([("foo.py", """
+      from typing import Generic, Type, TypeVar
+      T = TypeVar('T')
+      class Base(Generic[T]):
+        @property
+        def x(self) -> Type[T]:
+          return __any_object__
+      class Foo(Base[T]):
+        pass
+    """)]):
+      self.Check("""
+        import foo
+        def f(x: foo.Foo):
+          return x.x
+      """)
+
+  def test_pyi_property_setter(self):
+    with self.DepTree([("foo.pyi", """
+      from typing import Annotated, Any, Callable, Generic, TypeVar
+      ValueType = TypeVar('ValueType')
+      class Data(Generic[ValueType]):
+        value: Annotated[ValueType, 'property']
+      class Manager:
+        def get_data(
+            self, x: Callable[[ValueType], Any], y: Data[ValueType]
+        ) -> Data[ValueType]: ...
+    """)]):
+      self.Check("""
+        import foo
+        class Bar:
+          def __init__(self, x: foo.Manager):
+            self.data = x.get_data(__any_object__, __any_object__)
+            self.data.value = None
+      """)
+
 
 class GenericFeatureTest(test_base.BaseTest):
   """Tests for User-defined Generic Type."""
 
   def test_type_parameter_duplicated(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("a.pyi", """
         from typing import Generic, Dict
         T = TypeVar("T")
@@ -970,7 +1063,7 @@ class GenericFeatureTest(test_base.BaseTest):
         def __init__(self, x: T):
           self.x = x
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo))
       ty = self.Infer("""
         import foo
@@ -982,6 +1075,27 @@ class GenericFeatureTest(test_base.BaseTest):
         x1: int
         x2: str
       """)
+
+  def test_inherit_from_nested_generic(self):
+    ty = self.Infer("""
+      from typing import Generic, TypeVar
+      T = TypeVar('T')
+      class Foo:
+        class Bar(Generic[T]):
+          pass
+        class Baz(Bar[T]):
+          pass
+      class Qux(Foo.Bar[T]):
+        pass
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import Generic, TypeVar
+      T = TypeVar('T')
+      class Foo:
+        class Bar(Generic[T]): ...
+        class Baz(Foo.Bar[T]): ...
+      class Qux(Foo.Bar[T]): ...
+    """)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,6 @@ from typing import Any, Tuple
 from pytype import utils
 from pytype.pytd import pytd
 from pytype.pytd.codegen import pytdgen
-from pytype.pytd.parse import node as pytd_node
 
 # pylint: disable=g-import-not-at-top
 if sys.version_info >= (3, 8):
@@ -73,12 +72,8 @@ class ParseError(Exception):
       # Output a pointer below the error column, adjusting for stripped spaces.
       pos = indent + (self._column - 1) - (len(self._text) - len(stripped))
       lines.append("%*s^" % (pos, ""))
-    lines.append("%s: %s" % (type(self).__name__, utils.message(self)))
+    lines.append(f"{type(self).__name__}: {utils.message(self)}")
     return "\n".join(lines)
-
-
-# Type aliases
-Parameters = Tuple[pytd_node.Node, ...]
 
 
 class Ellipsis:  # pylint: disable=redefined-builtin

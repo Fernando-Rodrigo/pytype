@@ -1,8 +1,8 @@
 """Tests for methods."""
-from pytype import file_utils
 from pytype.pytd import pytd
 from pytype.pytd import pytd_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class MethodsTest(test_base.BaseTest):
@@ -57,6 +57,7 @@ class MethodsTest(test_base.BaseTest):
     self.assertHasSignature(ty.Lookup("f"), (self.int,), self.int)
     self.assertHasSignature(ty.Lookup("f"), (self.float,), self.float)
 
+  @test_base.skip("b/238794928: Function inference will be removed.")
   def test_add_float(self):
     ty = self.Infer("""
       def f(x):
@@ -473,6 +474,7 @@ class MethodsTest(test_base.BaseTest):
     """, deep=False, show_library_calls=True)
     self.assertHasSignature(ty.Lookup("f"), (self.int,), self.int)
 
+  @test_base.skip("b/238794928: Function inference will be removed.")
   def test_ambiguous_starstar(self):
     ty = self.Infer("""
       def f(x):
@@ -592,7 +594,7 @@ class MethodsTest(test_base.BaseTest):
     """)
 
   def test_builtin_starargs(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("myjson.pyi", """
         from typing import Any
         def loads(s: str, encoding: Any = ...) -> Any: ...
@@ -609,7 +611,7 @@ class MethodsTest(test_base.BaseTest):
       """)
 
   def test_builtin_starstarargs(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("myjson.pyi", """
         from typing import Any
         def loads(s: str, encoding: Any = ...) -> Any: ...
@@ -626,7 +628,7 @@ class MethodsTest(test_base.BaseTest):
       """)
 
   def test_builtin_keyword(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("myjson.pyi", """
         from typing import Any
         def loads(s: str, encoding: Any = ...) -> Any: ...
@@ -685,6 +687,31 @@ class MethodsTest(test_base.BaseTest):
           return x + y
     """, deep=False, show_library_calls=True)
     ty.Lookup("A")
+
+  def test_invalid_classmethod(self):
+    if self.options.python_version >= (3, 8):
+      error_pre_38 = ""
+      error = "  # not-callable[e]"
+    else:
+      error_pre_38 = "  # not-callable[e]"
+      error = ""
+    ty, err = self.InferWithErrors(f"""
+      def f(x):
+        return 42
+      class A:
+        @classmethod
+        @f{error_pre_38}
+        def myclassmethod(*args):{error}
+          return 3
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import Any
+      def f(x) -> int: ...
+      class A:
+        myclassmethod: Any
+    """)
+    self.assertErrorSequences(err, {
+        "e": ["int", "not callable", "@classmethod applied", "not a function"]})
 
   def test_staticmethod_smoke(self):
     ty = self.Infer("""

@@ -1,8 +1,9 @@
 """Abstract class representations."""
 
 import logging
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-import attr
+import attrs
 
 from pytype import datatypes
 from pytype.abstract import _base
@@ -16,9 +17,14 @@ from pytype.abstract import mixin
 from pytype.pytd import pytd
 from pytype.pytd import pytd_utils
 from pytype.pytd.codegen import decorate
+from pytype.typegraph import cfg
 
 log = logging.getLogger(__name__)
 _isinstance = abstract_utils._isinstance  # pylint: disable=protected-access
+
+# These classes can't be imported due to circular deps.
+_ContextType = Any  # context.Context
+_TypeParamType = Any  # typing.TypeParameter
 
 
 class BuildClass(_base.BaseValue):
@@ -95,10 +101,9 @@ class InterpreterClass(_instance_base.SimpleValue, class_mixin.Class):
   program.
   """
 
-  def __init__(self, name, bases, members, cls, ctx):
-    assert isinstance(name, str)
-    assert isinstance(bases, list)
-    assert isinstance(members, dict)
+  def __init__(self, name: str, bases: List[cfg.Variable],
+               members: Dict[str, cfg.Variable], cls: _base.BaseValue,
+               ctx: _ContextType):
     self._bases = bases
     super().__init__(name, ctx)
     self.members = datatypes.MonitorDict(members)
@@ -160,7 +165,7 @@ class InterpreterClass(_instance_base.SimpleValue, class_mixin.Class):
     for t in self.template:
       if t.full_name in self.all_formal_type_parameters:
         raise abstract_utils.GenericTypeError(
-            self, "Conflicting value for TypeVar %s" % t.full_name)
+            self, f"Conflicting value for TypeVar {t.full_name}")
 
   def collect_inner_cls_types(self, max_depth=5):
     """Collect all the type parameters from nested classes."""
@@ -180,13 +185,15 @@ class InterpreterClass(_instance_base.SimpleValue, class_mixin.Class):
     inner_classes = []
     for member in self.members.values():
       try:
-        value = abstract_utils.get_atomic_value(member, InterpreterClass)
+        value = abstract_utils.get_atomic_value(member)
       except abstract_utils.ConversionError:
+        continue
+      if not isinstance(value, class_mixin.Class) or value.module:
+        # Skip non-classes and imported classes.
         continue
       if value.official_name is None or (
           self.official_name and
-          value.official_name.startswith(f"{self.official_name}.")) or (
-              not self.ctx.options.enable_nested_classes and value != self):
+          value.official_name.startswith(f"{self.official_name}.")):
         inner_classes.append(value)
     return inner_classes
 
@@ -243,7 +250,7 @@ class InterpreterClass(_instance_base.SimpleValue, class_mixin.Class):
     for s in names:
       if not isinstance(s, str):
         self.ctx.errorlog.bad_slots(self.ctx.vm.frames,
-                                    "Invalid __slot__ entry: %r" % str(s))
+                                    f"Invalid __slot__ entry: {str(s)!r}")
         return None
     return tuple(self._mangle(s) for s in names)
 
@@ -273,27 +280,13 @@ class InterpreterClass(_instance_base.SimpleValue, class_mixin.Class):
       return super().instantiate(node, container)
 
   def __repr__(self):
-    return "InterpreterClass(%s)" % self.name
+    return f"InterpreterClass({self.name})"
 
   def __contains__(self, name):
     if name in self.members:
       return True
     annotations_dict = abstract_utils.get_annotations_dict(self.members)
     return annotations_dict and name in annotations_dict.annotated_locals
-
-  def update_official_name(self, name):
-    assert isinstance(name, str)
-    if (self.official_name is None or
-        name == self.name or
-        (self.official_name != self.name and name < self.official_name)):
-      # The lexical comparison is to ensure that, in the case of multiple calls
-      # to this method, the official name does not depend on the call order.
-      self.official_name = name
-      for member_var in self.members.values():
-        for member in member_var.data:
-          if (isinstance(member, InterpreterClass) and
-              self.ctx.options.enable_nested_classes):
-            member.update_official_name(f"{name}.{member.name}")
 
 
 class PyTDClass(
@@ -342,7 +335,6 @@ class PyTDClass(
           pytd_cls.metaclass,
           subst=datatypes.AliasingDict(),
           node=self.ctx.root_node)
-    self.official_name = self.name
     self.slots = pytd_cls.slots
     mixin.LazyMembers.init_mixin(self, mm)
     self.is_dynamic = self.compute_is_dynamic()
@@ -400,7 +392,7 @@ class PyTDClass(
     params = []
     for p in init.signatures[0].params[1:]:
       if p.name in protected:
-        params.append(attr.evolve(p, name=protected[p.name]))
+        params.append(attrs.evolve(p, name=protected[p.name]))
       else:
         params.append(p)
     with self.ctx.allow_recursive_convert():
@@ -418,8 +410,8 @@ class PyTDClass(
     if self.has_explicit_init:
       # Do not override an __init__ from the pyi file
       return
-    attrs = self.metadata[key]
-    fields = [x.to_pytd_constant() for x in attrs]
+    attributes = self.metadata[key]
+    fields = [x.to_pytd_constant() for x in attributes]
     self.pytd_cls = decorate.add_init_from_fields(self.pytd_cls, fields)
     init = self.pytd_cls.Lookup("__init__")
     self._member_map["__init__"] = init
@@ -441,11 +433,13 @@ class PyTDClass(
 
   def load_lazy_attribute(self, name, subst=None):
     try:
-      super().load_lazy_attribute(name, subst)
+      return super().load_lazy_attribute(name, subst)
     except self.ctx.convert.TypeParameterError as e:
       self.ctx.errorlog.unbound_type_param(self.ctx.vm.frames, self, name,
                                            e.type_param_name)
-      self.members[name] = self.ctx.new_unsolvable(self.ctx.root_node)
+      member = self.ctx.new_unsolvable(self.ctx.root_node)
+      self.members[name] = member
+      return member
 
   def _convert_member(self, name, member, subst=None):
     """Convert a member as a variable. For lazy lookup."""
@@ -461,7 +455,7 @@ class PyTDClass(
     elif isinstance(member, pytd.Class):
       return self.ctx.convert.constant_to_var(member, subst=subst, node=node)
     else:
-      raise AssertionError("Invalid class member %s" % pytd_utils.Print(member))
+      raise AssertionError(f"Invalid class member {pytd_utils.Print(member)}")
 
   def _new_instance(self, container, node, args):
     if self.full_name == "builtins.tuple" and args.is_empty():
@@ -480,7 +474,7 @@ class PyTDClass(
         abstract_utils.AsInstance(self.pytd_cls), {}, node)
 
   def __repr__(self):
-    return "PyTDClass(%s)" % self.name
+    return f"PyTDClass({self.name})"
 
   def __contains__(self, name):
     return name in self._member_map
@@ -515,19 +509,6 @@ class PyTDClass(
                   self.ctx.root_node, container=instance)
         return self._convert_member(name, c, subst)
 
-  def generate_ast(self):
-    """Generate this class's AST, including updated members."""
-    return pytd.Class(
-        name=self.name,
-        metaclass=self.pytd_cls.metaclass,
-        bases=self.pytd_cls.bases,
-        methods=tuple(self._member_map[m.name] for m in self.pytd_cls.methods),
-        constants=self.pytd_cls.constants,
-        classes=self.pytd_cls.classes,
-        decorators=self.pytd_cls.decorators,
-        slots=self.pytd_cls.slots,
-        template=self.pytd_cls.template)
-
 
 class FunctionPyTDClass(PyTDClass):
   """PyTDClass(Callable) subclass to support annotating higher-order functions.
@@ -554,24 +535,18 @@ class ParameterizedClass(
   E.g. a container.
 
   Attributes:
-    cls: A PyTDClass representing the base type.
+    base_cls: The base type.
     formal_type_parameters: An iterable of BaseValue, one for each type
       parameter.
   """
 
-  @classmethod
-  def get_generic_instance_type(cls, base_cls):
-    """This is used to annotate the `self` in a class."""
-    assert base_cls.template
-    formal_type_parameters = {}
-    for item in base_cls.template:
-      formal_type_parameters[item.name] = item
-    return cls(base_cls, formal_type_parameters, base_cls.ctx)
-
-  def __init__(self, base_cls, formal_type_parameters, ctx, template=None):
+  def __init__(
+      self, base_cls: Union[PyTDClass, InterpreterClass],
+      formal_type_parameters: Union[abstract_utils.LazyFormalTypeParameters,
+                                    Dict[str, _base.BaseValue]],
+      ctx: _ContextType, template: Optional[Tuple[_TypeParamType, ...]] = None):
     # A ParameterizedClass is created by converting a pytd.GenericType, whose
     # base type is restricted to NamedType and ClassType.
-    assert isinstance(base_cls, (PyTDClass, InterpreterClass))
     self.base_cls = base_cls
     super().__init__(base_cls.name, ctx)
     self._cls = None  # lazily loaded 'cls' attribute
@@ -581,7 +556,6 @@ class ParameterizedClass(
     self._formal_type_parameters = formal_type_parameters
     self._formal_type_parameters_loaded = False
     self._hash = None  # memoized due to expensive computation
-    self.official_name = self.base_cls.official_name
     if template is None:
       self._template = self.base_cls.template
     else:
@@ -595,7 +569,7 @@ class ParameterizedClass(
     self.type_param_check()
 
   def __repr__(self):
-    return "ParameterizedClass(cls=%r params=%s)" % (
+    return "ParameterizedClass(cls={!r} params={})".format(
         self.base_cls,
         self._formal_type_parameters)
 
@@ -651,8 +625,8 @@ class ParameterizedClass(
   def _raw_formal_type_parameters(self):
     assert isinstance(self._formal_type_parameters,
                       abstract_utils.LazyFormalTypeParameters)
-    template, parameters, _ = self._formal_type_parameters
-    for i, name in enumerate(template):
+    parameters = self._formal_type_parameters.parameters
+    for i, name in enumerate(self._formal_type_parameters.template):
       # TODO(rechen): A missing parameter should be an error.
       yield name, parameters[i] if i < len(parameters) else None
 
@@ -722,6 +696,14 @@ class ParameterizedClass(
   def set_class(self, node, var):
     self.base_cls.set_class(node, var)
 
+  @property
+  def official_name(self):
+    return self.base_cls.official_name
+
+  @official_name.setter
+  def official_name(self, official_name):
+    self.base_cls.official_name = official_name
+
   def _is_callable(self):
     if not isinstance(self.base_cls, (InterpreterClass, PyTDClass)):
       # We don't know how to instantiate this base_cls.
@@ -789,7 +771,7 @@ class CallableClass(ParameterizedClass, mixin.HasSlots):
     self.num_args = len(self.formal_type_parameters) - 2
 
   def __repr__(self):
-    return "CallableClass(%s)" % self.formal_type_parameters
+    return f"CallableClass({self.formal_type_parameters})"
 
   def get_formal_type_parameters(self):
     return {
@@ -850,7 +832,7 @@ class LiteralClass(ParameterizedClass):
     self._instance = instance
 
   def __repr__(self):
-    return "LiteralClass(%s)" % self._instance
+    return f"LiteralClass({self._instance})"
 
   def __eq__(self, other):
     if isinstance(other, LiteralClass):
@@ -885,6 +867,7 @@ class TupleClass(ParameterizedClass, mixin.HasSlots):
     super().__init__(base_cls, formal_type_parameters, ctx, template)
     mixin.HasSlots.init_mixin(self)
     self.set_slot("__getitem__", self.getitem_slot)
+    self.set_slot("__add__", self.add_slot)
     if isinstance(self._formal_type_parameters,
                   abstract_utils.LazyFormalTypeParameters):
       num_parameters = len(self._formal_type_parameters.template)
@@ -896,7 +879,7 @@ class TupleClass(ParameterizedClass, mixin.HasSlots):
     self.slots = ()  # tuples don't have any writable attributes
 
   def __repr__(self):
-    return "TupleClass(%s)" % self.formal_type_parameters
+    return f"TupleClass({self.formal_type_parameters})"
 
   def compute_mro(self):
     # ParameterizedClass removes the base PyTDClass(tuple) from the mro; add it
@@ -980,3 +963,16 @@ class TupleClass(ParameterizedClass, mixin.HasSlots):
         name in self._slots):
       return mixin.HasSlots.get_special_attribute(self, node, name, valself)
     return super().get_special_attribute(node, name, valself)
+
+  def add_slot(self, node, other_var):
+    """Implementation of tuple.__add__."""
+    try:
+      other = abstract_utils.get_atomic_value(other_var)
+    except abstract_utils.ConversionError:
+      pass
+    else:
+      if self._instance and _isinstance(other, "Tuple"):
+        pyval = self._instance.pyval + other.pyval
+        ret = _instances.Tuple(pyval, self.ctx)
+        return node, ret.to_variable(node)
+    return self.call_pytd(node, "__add__", self.instantiate(node), other_var)

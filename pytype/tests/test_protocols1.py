@@ -3,9 +3,9 @@
 Based on PEP 544 https://www.python.org/dev/peps/pep-0544/.
 """
 
-from pytype import file_utils
 from pytype.pytd import pytd_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class ProtocolTest(test_base.BaseTest):
@@ -26,7 +26,7 @@ class ProtocolTest(test_base.BaseTest):
     """)
 
   def test_generic(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Generic, Protocol, TypeVar
         T = TypeVar("T")
@@ -46,7 +46,7 @@ class ProtocolTest(test_base.BaseTest):
     self.assertTypesMatchPytd(ty, """
       from typing import Generic, Protocol, TypeVar
       T = TypeVar("T")
-      class Foo(Protocol, Generic[T]): ...
+      class Foo(Generic[T], Protocol): ...
     """)
 
   def test_generic_alias(self):
@@ -62,9 +62,9 @@ class ProtocolTest(test_base.BaseTest):
       from typing import Generic, Protocol, TypeVar
       T = TypeVar("T")
       Foo = Protocol[T]
-      class Bar(Protocol, Generic[T]): ...
+      class Bar(Generic[T], Protocol): ...
     """)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", pytd_utils.Print(foo_ty))
       ty = self.Infer("""
         import foo
@@ -77,13 +77,13 @@ class ProtocolTest(test_base.BaseTest):
       import foo
       from typing import Generic, Protocol, TypeVar
       T = TypeVar('T')
-      class Baz(Protocol, Generic[T]): ...
+      class Baz(Generic[T], Protocol): ...
     """)
 
   def test_self_referential_protocol(self):
     # Some protocols use methods that return instances of the protocol, e.g.
     # Iterator's __next__ returns Iterator. Make sure that doesn't crash pytype.
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Generic, TypeVar
         _TElem = TypeVar("_TElem")
@@ -117,7 +117,7 @@ class ProtocolTest(test_base.BaseTest):
     """)
 
   def test_pyi_protocol_in_typevar(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Generic, TypeVar
         from typing_extensions import Protocol

@@ -1,5 +1,7 @@
 """Constructs related to type annotations."""
 
+import collections
+import dataclasses
 import logging
 import typing
 from typing import Mapping, Tuple, Type, Union as _Union
@@ -62,7 +64,7 @@ class AnnotationClass(_instance_base.SimpleValue, mixin.HasSlots):
     raise NotImplementedError(self.__class__.__name__)
 
   def __repr__(self):
-    return "AnnotationClass(%s)" % self.name
+    return f"AnnotationClass({self.name})"
 
   def _get_class(self):
     return self.ctx.convert.type_type
@@ -74,6 +76,9 @@ class AnnotationContainer(AnnotationClass):
   def __init__(self, name, ctx, base_cls):
     super().__init__(name, ctx)
     self.base_cls = base_cls
+
+  def __repr__(self):
+    return f"AnnotationContainer({self.name})"
 
   def _sub_annotation(
       self, annot: _base.BaseValue, subst: Mapping[str, _base.BaseValue]
@@ -229,13 +234,20 @@ class AnnotationContainer(AnnotationClass):
       # class_mixin.Class, and (2) we have to postpone error-checking anyway so
       # we might as well postpone the entire evaluation.
       printed_params = []
+      added_imports = collections.defaultdict(set)
       for i, param in enumerate(inner):
         if i in ellipses:
           printed_params.append("...")
         else:
-          printed_params.append(pytd_utils.Print(param.get_instance_type(node)))
-      expr = "%s[%s]" % (self.base_cls.expr, ", ".join(printed_params))
-      annot = LateAnnotation(expr, self.base_cls.stack, self.ctx)
+          typ = param.get_instance_type(node)
+          annot, imports = pytd_utils.MakeTypeAnnotation(typ)
+          printed_params.append(annot)
+          for k, v in imports.items():
+            added_imports[k] |= v
+
+      expr = f"{self.base_cls.expr}[{', '.join(printed_params)}]"
+      annot = LateAnnotation(expr, self.base_cls.stack, self.ctx,
+                             imports=added_imports)
       self.ctx.vm.late_annotations[self.base_cls.expr].append(annot)
       return annot
     template, processed_inner, abstract_class = self._get_value_info(
@@ -277,21 +289,24 @@ class AnnotationContainer(AnnotationClass):
                 root_node, container=abstract_utils.DUMMY_CONTAINER)
         else:
           actual = param_value.instantiate(root_node)
-        bad = self.ctx.matcher(root_node).bad_matches(actual, formal_param)
+        bad, _ = self.ctx.matcher(root_node).bad_matches(actual, formal_param)
         if bad:
-          if not isinstance(param_value, TypeParameter):
-            # If param_value is not a TypeVar, we substitute in TypeVar bounds
-            # and constraints in formal_param for a more helpful error message.
-            formal_param = self.ctx.annotation_utils.sub_one_annotation(
-                root_node, formal_param, [{}])
-            details = None
-          elif isinstance(formal_param, TypeParameter):
-            details = (f"TypeVars {formal_param.name} and {param_value.name} "
-                       "have incompatible bounds or constraints.")
+          if isinstance(param_value, TypeParameter):
+            # bad_matches replaces type parameters in the expected type with
+            # their concrete values, which is usually what we want. But when the
+            # actual type is a type parameter, then it's more helpful to show
+            # the expected type as a type parameter as well.
+            bad = [dataclasses.replace(match, expected=dataclasses.replace(
+                match.expected, typ=formal_param)) for match in bad]
+            if isinstance(formal_param, TypeParameter):
+              details = (f"TypeVars {formal_param.name} and {param_value.name} "
+                         "have incompatible bounds or constraints.")
+            else:
+              details = None
           else:
             details = None
           self.ctx.errorlog.bad_concrete_type(
-              self.ctx.vm.frames, root_node, formal_param, actual, bad, details)
+              self.ctx.vm.frames, root_node, bad, details)
           return self.ctx.convert.unsolvable
 
     try:
@@ -299,6 +314,9 @@ class AnnotationContainer(AnnotationClass):
     except abstract_utils.GenericTypeError as e:
       self.ctx.errorlog.invalid_annotation(self.ctx.vm.frames, e.annot, e.error)
       return self.ctx.convert.unsolvable
+
+  def call(self, node, func, args, alias_map=None):
+    return self._call_helper(node, self.base_cls, func, args)
 
 
 class TypeParameter(_base.BaseValue):
@@ -351,8 +369,8 @@ class TypeParameter(_base.BaseValue):
                  self.contravariant))
 
   def __repr__(self):
-    return "TypeParameter(%r, constraints=%r, bound=%r, module=%r)" % (
-        self.name, self.constraints, self.bound, self.module)
+    return ("TypeParameter({!r}, constraints={!r}, bound={!r}, module={!r})"
+            .format(self.name, self.constraints, self.bound, self.module))
 
   def instantiate(self, node, container=None):
     var = self.ctx.program.NewVariable()
@@ -371,8 +389,8 @@ class TypeParameter(_base.BaseValue):
 
   def update_official_name(self, name):
     if self.name != name:
-      message = "TypeVar(%r) must be stored as %r, not %r" % (
-          self.name, self.name, name)
+      message = (f"TypeVar({self.name!r}) must be stored as {self.name!r}, "
+                 f"not {name!r}")
       self.ctx.errorlog.invalid_typevar(self.ctx.vm.frames, message)
 
   def call(self, node, func, args, alias_map=None):
@@ -396,7 +414,7 @@ class TypeParameterInstance(_base.BaseValue):
       return node, self.ctx.convert.empty.to_variable(self.ctx.root_node)
 
   def __repr__(self):
-    return "TypeParameterInstance(%r)" % self.name
+    return f"TypeParameterInstance({self.name!r})"
 
   def __eq__(self, other):
     if isinstance(other, type(self)):
@@ -434,7 +452,7 @@ class Union(_base.BaseValue, mixin.NestedAnnotation, mixin.HasSlots):
       self._printing = True
       printed_contents = ", ".join(repr(o) for o in self.options)
       self._printing = False
-    return "%s[%s]" % (self.name, printed_contents)
+    return f"{self.name}[{printed_contents}]"
 
   def __eq__(self, other):
     if isinstance(other, type(self)):
@@ -534,11 +552,13 @@ class LateAnnotation:
 
   _RESOLVING = object()
 
-  def __init__(self, expr, stack, ctx):
+  def __init__(self, expr, stack, ctx, *, imports=None):
     self.expr = expr
     self.stack = stack
     self.ctx = ctx
     self.resolved = False
+    # Any new imports the annotation needs while resolving.
+    self._imports = imports or {}
     self._type = ctx.convert.unsolvable  # the resolved type of `expr`
     self._unresolved_instances = set()
     # _attribute_names needs to be defined last! This contains the names of all
@@ -580,7 +600,7 @@ class LateAnnotation:
     return self.expr
 
   def __repr__(self):
-    return "LateAnnotation(%r, resolved=%r)" % (
+    return "LateAnnotation({!r}, resolved={!r})".format(
         self.expr, self._type if self.resolved else None)
 
   # __hash__ and __eq__ need to be explicitly defined for Python to use them in
@@ -610,6 +630,17 @@ class LateAnnotation:
     # 'if self.resolved' is True when self is partially resolved, but code that
     # really needs to tell partially and fully resolved apart can do so.
     self.resolved = LateAnnotation._RESOLVING
+    # Add implicit imports for typing, since we can have late annotations like
+    # `set[int]` which get converted to `typing.Set[int]`.
+    if "typing" in self._imports:
+      mod = self.ctx.loader.import_name("typing")
+      for v in self._imports["typing"]:
+        if v not in f_globals.members:
+          if v == "Any":
+            typ = self.ctx.convert.unsolvable
+          else:
+            typ = self.ctx.convert.name_to_value(f"typing.{v}", ast=mod)
+          f_globals.members[v] = typ.to_variable(node)
     var, errorlog = abstract_utils.eval_expr(self.ctx, node, f_globals,
                                              f_locals, self.expr)
     if errorlog:

@@ -19,19 +19,21 @@ class IndexerTestMixin:
     """Generate references from a code string."""
     args = {"version": self.python_version}
     args.update(kwargs)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("t.py", code)
       options = config.Options.create(d["t.py"])
       options.tweak(**args)
       return indexer.process_file(options, preserve_pytype_vm=True)
 
-  def generate_kythe(self, code):
+  def generate_kythe(self, code, **kwargs):
     """Generate a kythe index from a code string."""
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("t.py", code)
       options = config.Options.create(d["t.py"])
       options.tweak(pythonpath=[d.path], version=self.python_version)
-      kythe_args = kythe.Args(corpus="corpus", root="root", path="path")
+      k_args = {k: k for k in ["corpus", "root", "path"]}
+      k_args.update(kwargs)
+      kythe_args = kythe.Args(**k_args)
       ix = indexer.process_file(options)
       kg = kythe.generate_graph(ix, kythe_args)
       # Collect all the references from the kythe graph.
@@ -43,7 +45,7 @@ class IndexerTestMixin:
     alias = index.aliases[fqname]
     self.assertIsInstance(alias, indexer.Remote)
     self.assertEqual(
-        "{module}.{name}".format(module=alias.module, name=alias.name), target)
+        f"{alias.module}.{alias.name}", target)
 
   def assertDef(self, index, fqname, name, typ):
     self.assertIn(fqname, index.defs)
@@ -94,13 +96,13 @@ class IndexerTest(test_base.BaseTest, IndexerTestMixin):
         Y.__name__
     """
     stub = "class X: pass"
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("t.py", code)
       d.create_file("f.pyi", stub)
-      d.create_file("x/y.pyi", stub)
-      d.create_file("a/b.pyi", stub)
-      d.create_file("p/q.pyi", stub)
-      d.create_file("u/v.pyi", stub)
+      d.create_file(file_utils.replace_separator("x/y.pyi"), stub)
+      d.create_file(file_utils.replace_separator("a/b.pyi"), stub)
+      d.create_file(file_utils.replace_separator("p/q.pyi"), stub)
+      d.create_file(file_utils.replace_separator("u/v.pyi"), stub)
       options = config.Options.create(d["t.py"])
       options.tweak(pythonpath=[d.path], version=self.python_version)
       ix = indexer.process_file(options)
@@ -152,7 +154,16 @@ class IndexerTest(test_base.BaseTest, IndexerTestMixin):
           # x.y as references to remote files
           ("x", ":module:", "x/__init__.py"),
           ("y", ":module:", "x/y.py"),
+          # calls
+          ("X()", "module.X", "p/q.py"),
+          ("X()", "module.X", "f.py"),
+          ("X()", "module.X", "a/b.py"),
+          ("X()", "module.X", "x/y.py"),
+          ("X()", "module.X", "u/v.py"),
       }
+
+      f = file_utils.replace_separator
+      expected = set((x[0], x[1], f(x[2])) for x in expected)
 
       # Resolve filepaths within the tempdir.
       expected = [(ref, target, d[path]) for (ref, target, path) in expected]
@@ -164,7 +175,8 @@ class IndexerTest(test_base.BaseTest, IndexerTestMixin):
         def f(x):
           return 42
     """)
-    options = config.Options.create("/path/to/nonexistent/file.py")
+    options = config.Options.create(
+        file_utils.replace_separator("/path/to/nonexistent/file.py"))
     options.tweak(version=self.python_version)
     ix = indexer.process_file(options, source_text=code)
     self.assertDef(ix, "module.f", "f", "FunctionDef")
@@ -195,6 +207,19 @@ class IndexerTest(test_base.BaseTest, IndexerTestMixin):
     # Other nodes should have language="python"
     node = kythe_index[3]
     self.assertEqual(node["source"]["language"], "python")
+
+  def test_kythe_skip_stdlib(self):
+    code = textwrap.dedent("""
+      import os
+    """)
+    kythe_index = self.generate_kythe(code)
+    imp = [x for x in kythe_index
+           if x.get("edge_kind") == "/kythe/edge/ref/imports"]
+    self.assertEqual(len(imp), 1)
+    kythe_index = self.generate_kythe(code, skip_stdlib=True)
+    imp = [x for x in kythe_index
+           if x.get("edge_kind") == "/kythe/edge/ref/imports"]
+    self.assertFalse(imp)
 
   def test_multiline_attr(self):
     # Test that lookahead doesn't crash.
@@ -248,6 +273,19 @@ class IndexerTest(test_base.BaseTest, IndexerTestMixin):
       self.assertIsNone(d.data)
     for r in ix.refs:
       self.assertIsNone(r.data)
+
+  def test_docstring(self):
+    ix = self.index_code("""
+        def f():
+          '''Multiline docstring
+
+          foo
+            bar
+          '''
+    """)
+    d = ix.defs["module.f"]
+    self.assertEqual(d.doc.text, "Multiline docstring\n\nfoo\n  bar")
+    self.assertGreater(d.doc.length, len(d.doc.text))
 
 
 class IndexerTestPy3(test_base.BaseTest, IndexerTestMixin):

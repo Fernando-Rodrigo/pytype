@@ -1,7 +1,7 @@
 """Test unpacking."""
 
-from pytype import file_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class TestUnpack(test_base.BaseTest):
@@ -28,8 +28,29 @@ class TestUnpack(test_base.BaseTest):
       e = ...  # type: Tuple[Union[A, str, int], ...]
     """)
 
+  def test_empty(self):
+    ty, err = self.InferWithErrors("""
+      a, *b = []  # bad-unpacking[e]
+      c, *d = [1]
+      *e, f = [2]
+      g, *h, i = [1, 2]
+    """)
+    self.assertTypesMatchPytd(ty, """
+      from typing import Any, List
+      a: Any
+      b: List[nothing]
+      c: int
+      d: List[nothing]
+      e: List[nothing]
+      f: int
+      g: int
+      h: List[nothing]
+      i: int
+    """)
+    self.assertErrorSequences(err, {"e": ["0 values", "1 variable"]})
+
   def test_unpack_indefinite_from_pytd(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Tuple
         a: Tuple[int, ...]
@@ -49,7 +70,7 @@ class TestUnpack(test_base.BaseTest):
     # TODO(b/63407497): Enabling --strict-parameter-checks leads to a
     # wrong-arg-types error on line 6.
     self.options.tweak(strict_parameter_checks=False)
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Tuple
         a: Tuple[int, ...]
@@ -77,7 +98,7 @@ class TestUnpack(test_base.BaseTest):
     """)
 
   def test_match_typed_starargs(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Any
         def f(x:int, *args: str): ...
@@ -99,7 +120,7 @@ class TestUnpack(test_base.BaseTest):
     """)
 
   def test_overloaded_function(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Any
         @overload
@@ -117,7 +138,7 @@ class TestUnpack(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_unpack_kwargs_without_starargs(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Any, Dict, Optional
         def f(x: int, y: str, z: bool = True, a: Optional[object] = None ): ...
@@ -133,7 +154,7 @@ class TestUnpack(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_str(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Optional, Text
         class A: ...
@@ -177,7 +198,7 @@ class TestUnpack(test_base.BaseTest):
 
   def test_erroneous_splat(self):
     # Don't crash on an unnecessary splat.
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         from typing import Any, Sequence
         def f(x: Sequence[Any], y: str): ...
@@ -196,7 +217,7 @@ class TestUnpack(test_base.BaseTest):
       """, pythonpath=[d.path])
 
   def test_unpack_namedtuple(self):
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         def f(a, b, c, d, e, f): ...
       """)

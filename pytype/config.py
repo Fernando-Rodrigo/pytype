@@ -9,14 +9,18 @@ import contextlib
 import logging
 import os
 import sys
+from typing import List, overload
 
 from pytype import datatypes
 from pytype import errors
+from pytype import file_utils
 from pytype import imports_map_loader
 from pytype import module_utils
 from pytype import utils
-from pytype.pytd import pytd_utils
+from pytype.pyc import compiler
 from pytype.typegraph import cfg_utils
+
+from typing_extensions import Literal
 
 
 LOG_LEVELS = [logging.CRITICAL, logging.ERROR, logging.WARNING, logging.INFO,
@@ -26,7 +30,9 @@ uses = utils.AnnotatingDecorator()  # model relationship between options
 
 _LIBRARY_ONLY_OPTIONS = {
     # a custom file opening function that will be used in place of builtins.open
-    "open_function": open
+    "open_function": open,
+    # Imports map as a list of tuples.
+    "imports_map_items": None,
 }
 
 
@@ -34,6 +40,14 @@ class Options:
   """Encapsulation of the configuration options."""
 
   _HAS_DYNAMIC_ATTRIBUTES = True
+
+  @overload
+  def __init__(
+      self, argv_or_options: List[str], command_line: Literal[True]): ...
+
+  @overload
+  def __init__(self, argv_or_options: argparse.Namespace,
+               command_line: Literal[False] = ...): ...
 
   def __init__(self, argv_or_options, command_line=False):
     """Parse and encapsulate the configuration options.
@@ -53,6 +67,8 @@ class Options:
       sys.exit(2): bad option or input filenames.
     """
     argument_parser = make_parser()
+    # Since `config` is part of our public API, we do runtime type checks to
+    # catch errors by users not using a static type checker.
     if command_line:
       assert isinstance(argv_or_options, list)
       options = argument_parser.parse_args(argv_or_options)
@@ -65,8 +81,11 @@ class Options:
       if not hasattr(options, name):
         setattr(options, name, default)
     names = set(vars(options))
+    opt_map = {k: v.option_strings[-1]
+               for k, v in argument_parser.actions.items()
+               if v.option_strings}
     try:
-      Postprocessor(names, options, self).process()
+      Postprocessor(names, opt_map, options, self).process()
     except PostprocessingError as e:
       if command_line:
         argument_parser.error(utils.message(e))
@@ -80,7 +99,7 @@ class Options:
     unknown_options = (set(kwargs) - set(argument_parser.actions) -
                        set(_LIBRARY_ONLY_OPTIONS))
     if unknown_options:
-      raise ValueError("Unrecognized options: %s" % ", ".join(unknown_options))
+      raise ValueError(f"Unrecognized options: {', '.join(unknown_options)}")
     options = argument_parser.parse_args(
         [input_filename or "dummpy_input_file"])
     for k, v in kwargs.items():
@@ -93,7 +112,7 @@ class Options:
       setattr(self, k, v)
 
   def __repr__(self):
-    return "\n".join(["%s: %r" % (k, v)
+    return "\n".join([f"{k}: {v!r}"
                       for k, v in sorted(self.__dict__.items())
                       if not k.startswith("_")])
 
@@ -153,13 +172,11 @@ FEATURE_FLAGS = [
      "Use the enum overlay for more precise enum checking."),
     ("--build-dict-literals-from-kwargs", False,
      "Build dict literals from dict(k=v, ...) calls."),
-    ("--strict_namedtuple_checks", False,
+    ("--strict_namedtuple_checks", True,
      ("Enable stricter namedtuple checks, such as unpacking and "
       "'typing.Tuple' compatibility.")),
     ("--strict-parameter-checks", False,
      "Enable exhaustive checking of function parameter types."),
-    ("--enable-nested-classes", False,
-     "Enable support for nested classes in .py files."),
     ("--strict-primitive-comparisons", False,
      "Emit errors for comparisons between incompatible primitive types."),
     ("--overriding-default-value-checks", False,
@@ -172,6 +189,8 @@ FEATURE_FLAGS = [
      "Enable parameter type checks for overriding methods."),
     ("--overriding-return-type-checks", False,
      "Enable return type checks for overriding methods."),
+    ("--enable-cached-property", False,
+     "Support pyglib's @cached.property."),
 ]
 
 
@@ -239,6 +258,11 @@ def add_pickle_options(o):
       "--precompiled-builtins", action="store",
       dest="precompiled_builtins", default=None,
       help="Use the supplied file as precompiled builtins pyi.")
+  o.add_argument(
+      "--pickle-metadata", type=str, action="store",
+      dest="pickle_metadata", default=None,
+      help=("Comma separated list of metadata strings to be saved in the "
+            "pickled file."))
 
 
 def add_infrastructure_options(o):
@@ -402,8 +426,9 @@ class PostprocessingError(Exception):
 class Postprocessor:
   """Postprocesses configuration options."""
 
-  def __init__(self, names, input_options, output_options=None):
+  def __init__(self, names, opt_map, input_options, output_options=None):
     self.names = names
+    self.opt_map = opt_map
     self.input_options = input_options
     # If output not specified, process in-place.
     self.output_options = output_options or input_options
@@ -440,58 +465,86 @@ class Postprocessor:
         dependencies = uses.lookup.get(f.processor.__name__)
         if dependencies:
           # that method has a @uses decorator
-          f.incoming = tuple(nodes[use] for use in dependencies)
+          f.incoming = tuple(nodes[use.lstrip("+-")] for use in dependencies)
 
     # process the option list in the right order:
     for node in cfg_utils.topological_sort(nodes.values()):
       value = getattr(self.input_options, node.name)
       if node.processor is not None:
+        dependencies = uses.lookup.get(node.processor.__name__, [])
+        for d in dependencies:
+          if d.startswith("-"):
+            self._check_exclusive(node.name, value, d.lstrip("-"))
+          elif d.startswith("+"):
+            self._check_required(node.name, value, d.lstrip("+"))
         node.processor(value)
       else:
         setattr(self.output_options, node.name, value)
 
   def error(self, message, key=None):
     if key:
-      message = "argument --%s: %s" % (key, message)
+      message = f"argument --{key}: {message}"
     raise PostprocessingError(message)
 
-  @uses(["output"])
+  def _display_opt(self, opt):
+    if opt in ("input", "output"):
+      return f"an {opt} file"
+    elif opt in _LIBRARY_ONLY_OPTIONS:
+      return f"library option {opt}"
+    else:
+      return self.opt_map[opt]
+
+  def _check_exclusive(self, name, value, existing):
+    """Check for argument conflicts."""
+    if existing in _LIBRARY_ONLY_OPTIONS:
+      # Library-only options are often used as an alternate way of setting a
+      # flag option, so they are part of the @uses dependencies of _store_option
+      # So we need to check them in the input, not the output - they are
+      # typically being written to the option they are being checked against.
+      existing_val = getattr(self.input_options, existing, None)
+    else:
+      existing_val = getattr(self.output_options, existing, None)
+    if existing == "pythonpath":
+      is_set = existing_val not in (None, "", [], [""])
+    else:
+      is_set = bool(existing_val)
+    if value and is_set:
+      opt = self._display_opt(existing)
+      self.error(f"Not allowed with {opt}", name)
+
+  def _check_required(self, name, value, existing):
+    """Check for required args."""
+    if value and not getattr(self.output_options, existing, None):
+      opt = self._display_opt(existing)
+      self.error(f"Can't use without {opt}", name)
+
+  @uses(["-output"])
   def _store_check(self, check):
     if check is None:
       self.output_options.check = not self.output_options.output
-    elif self.output_options.output:
-      self.error("Not allowed with an output file", "check")
     else:
       self.output_options.check = check
 
-  @uses(["output"])
+  @uses(["+output"])
   def _store_pickle_output(self, pickle_output):
     if pickle_output:
-      if self.output_options.output is None:
-        self.error("Can't use without --output", "pickle-output")
-      elif not pytd_utils.IsPickle(self.output_options.output):
-        self.error("Must specify %s file for --output" % pytd_utils.PICKLE_EXT,
+      if not file_utils.is_pickle(self.output_options.output):
+        self.error(f"Must specify {file_utils.PICKLE_EXT} file for --output",
                    "pickle-output")
     self.output_options.pickle_output = pickle_output
 
-  @uses(["output", "pickle_output"])
+  @uses(["output", "+pickle_output"])
   def _store_verify_pickle(self, verify_pickle):
     if not verify_pickle:
       self.output_options.verify_pickle = None
-    elif not self.output_options.pickle_output:
-      self.error("Can't use without --pickle-output", "verify-pickle")
     else:
       self.output_options.verify_pickle = self.output_options.output.replace(
-          pytd_utils.PICKLE_EXT, ".pyi")
+          file_utils.PICKLE_EXT, ".pyi")
 
-  @uses(["input", "show_config", "pythonpath", "version"])
+  @uses(["-input", "show_config", "-pythonpath", "version"])
   def _store_generate_builtins(self, generate_builtins):
     """Store the generate-builtins option."""
     if generate_builtins:
-      if self.output_options.input:
-        self.error("Not allowed with an input file", "generate-builtins")
-      if self.output_options.pythonpath != [""]:
-        self.error("Not allowed with --pythonpath", "generate-builtins")
       # Set the default pythonpath to [] rather than [""]
       self.output_options.pythonpath = []
     elif (not self.output_options.input and
@@ -514,7 +567,7 @@ class Postprocessor:
   def _store_verbosity(self, verbosity):
     """Configure logging."""
     if not -1 <= verbosity < len(LOG_LEVELS):
-      self.error("invalid --verbosity: %s" % verbosity)
+      self.error(f"invalid --verbosity: {verbosity}")
     self.output_options.verbosity = verbosity
 
   def _store_pythonpath(self, pythonpath):
@@ -533,25 +586,15 @@ class Postprocessor:
       version = sys.version_info[:2]
     if len(version) != 2:
       self.error(
-          "--python_version must be <major>.<minor>: %r" % python_version)
+          f"--python_version must be <major>.<minor>: {python_version!r}")
     # Check that we have a version supported by pytype.
     utils.validate_version(version)
     self.output_options.python_version = version
 
-    if utils.can_compile_bytecode_natively(self.output_options.python_version):
-      # pytype does not need an exe for bytecode compilation. Abort early to
-      # avoid extracting a large unused exe into /tmp.
-      self.output_options.python_exe = None
-      return
-
-    for exe in utils.get_python_exes(self.output_options.python_version):
-      exe_version = utils.get_python_exe_version(exe)
-      if exe_version == self.output_options.python_version:
-        self.output_options.python_exe = exe
-        break
-    else:
-      self.error("Need a valid python%d.%d executable in $PATH" %
-                 self.output_options.python_version)
+    try:
+      self.output_options.python_exe = compiler.get_python_executable(version)
+    except compiler.PythonNotFoundError:
+      self.error("Need a valid python%d.%d executable in $PATH" % version)
 
   def _store_disable(self, disable):
     if disable:
@@ -559,12 +602,10 @@ class Postprocessor:
     else:
       self.output_options.disable = []
 
-  @uses(["disable"])
+  @uses(["-disable"])
   def _store_enable_only(self, enable_only):
     """Process the 'enable-only' option."""
     if enable_only:
-      if self.output_options.disable:
-        self.error("Only one of 'disable' or 'enable-only' can be specified.")
       self.output_options.disable = list(
           errors.get_error_names_set() - set(enable_only.split(",")))
     else:
@@ -572,24 +613,30 @@ class Postprocessor:
       # expect a list.
       self.output_options.enable_only = []
 
-  @uses(["pythonpath", "output", "verbosity", "open_function"])
+  @uses(["-pythonpath", "output", "verbosity", "open_function",
+         "-imports_map_items"
+         ])
   def _store_imports_map(self, imports_map):
     """Postprocess --imports_info."""
     if imports_map:
-      if self.output_options.pythonpath not in ([], [""]):
-        self.error("Not allowed with --pythonpath", "imports_info")
-
       with verbosity_from(self.output_options):
-        self.output_options.imports_map = imports_map_loader.build_imports_map(
-            imports_map, self.output_options.open_function)
+        builder = imports_map_loader.ImportsMapBuilder(self.output_options)
+        self.output_options.imports_map = builder.build_from_file(imports_map)
+
+  @uses(["-pythonpath", "output", "verbosity", "open_function"])
+  def _store_imports_map_items(self, imports_map_items):
+    """Postprocess imports_maps_items."""
+    if imports_map_items:
+      with verbosity_from(self.output_options):
+        builder = imports_map_loader.ImportsMapBuilder(self.output_options)
+        self.output_options.imports_map = builder.build_from_items(
+            imports_map_items)
     else:
+      # This option sets imports_map first, before _store_imports_map.
       self.output_options.imports_map = None
 
-  @uses(["output_cfg"])
+  @uses(["-output_cfg"])
   def _store_output_typegraph(self, output_typegraph):
-    if self.output_options.output_cfg and output_typegraph:
-      self.error(
-          "Can output CFG or typegraph, but not both", "output-typegraph")
     self.output_options.output_typegraph = output_typegraph
 
   @uses(["report_errors"])
@@ -642,6 +689,12 @@ class Postprocessor:
     else:
       self.error("Argument %r is not a pair of non-empty file names "
                  "separated by %r" % (item, os.pathsep))
+
+  def _store_pickle_metadata(self, pickle_metadata):
+    if pickle_metadata:
+      self.output_options.pickle_metadata = pickle_metadata.split(",")
+    else:
+      self.output_options.pickle_metadata = []
 
 
 def _set_verbosity(verbosity, timestamp_logs, debug_logs):

@@ -92,6 +92,7 @@ py_library(
   DEPS
     .named_tuple
     .overlay
+    .typing_overlay
 )
 
 py_library(
@@ -117,6 +118,7 @@ py_library(
     pytype.special_builtins
     pytype.abstract.abstract
     pytype.pytd.pytd
+    pytype.typegraph.cfg
 )
 
 py_library(
@@ -182,14 +184,10 @@ py_library(
     .enum_overlay
     .flax_overlay
     .future_overlay
-    .named_tuple
-    .overlay
-    .overlay_utils
     .pytype_extensions_overlay
     .six_overlay
     .subprocess_overlay
     .sys_overlay
-    .typed_dict
     .typing_extensions_overlay
     .typing_overlay
 )

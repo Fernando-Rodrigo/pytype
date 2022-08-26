@@ -143,6 +143,7 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
       "compute_mro",
       "get_own_new",
       "get_special_attribute",
+      "update_official_name",
   )
 
   def __new__(cls, *unused_args, **unused_kwds):
@@ -417,7 +418,7 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
     node, method = self.ctx.attribute_handler.get_attribute(
         node, value.data, method_name, value)
     if method:
-      call_repr = "%s.%s(..._)" % (self.name, method_name)
+      call_repr = f"{self.name}.{method_name}(..._)"
       log.debug("calling %s", call_repr)
       node, ret = function.call_function(self.ctx, node, method, args)
       log.debug("%s returned %r", call_repr, ret)
@@ -543,6 +544,21 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
           base_attrs.append(a)
     return base_attrs + cls_attrs
 
+  def _recompute_attrs_type_from_mro(self, all_attrs, type_params):
+    """Traverse the MRO and apply Generic type params to class attributes.
+
+    This IS REQUIRED for dataclass instances that inherits from a Generic.
+
+    Args:
+      all_attrs: All __init__ attributes of a class.
+      type_params: List of ParameterizedClass instances that will override
+        TypeVar attributes in all_attrs.
+    """
+    for typ_name, typ_obj in type_params.items():
+      for attr in all_attrs.values():
+        if typ_name == attr.typ.cls.name:
+          attr.typ = typ_obj
+
   def _get_attrs_from_mro(self, cls_attrs, metadata_key):
     """Traverse the MRO and collect base class attributes for metadata_key."""
 
@@ -552,6 +568,7 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
 
     all_attrs = {}
     sub_attrs = []
+    type_params = {}
     attributes_to_ignore = set()
     for base_cls in reversed(self.mro[1:]):
       if not isinstance(base_cls, Class):
@@ -559,6 +576,12 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
       # Some third-party dataclass implementations add implicit fields that
       # should not be considered inherited attributes.
       attributes_to_ignore.update(getattr(base_cls, "IMPLICIT_FIELDS", ()))
+      # Any subclass of a Parameterized dataclass must inherit attributes from
+      # its parent's init.
+      # See https://github.com/google/pytype/issues/1104
+      if _isinstance(base_cls, "ParameterizedClass"):
+        type_params = base_cls.formal_type_parameters
+        base_cls = base_cls.base_cls
       if metadata_key in base_cls.metadata:
         sub_attrs.append([a for a in base_cls.metadata[metadata_key]
                           if a.name not in attributes_to_ignore])
@@ -566,6 +589,8 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
     for attrs in sub_attrs:
       for a in attrs:
         all_attrs[a.name] = a
+
+    self._recompute_attrs_type_from_mro(all_attrs, type_params)
     return list(all_attrs.values())
 
   def record_attr_ordering(self, own_attrs):
@@ -589,3 +614,16 @@ class Class(metaclass=mixin.MixinMeta):  # pylint: disable=undefined-variable
     # Stash attributes in class metadata for subclasses.
     self.metadata[key] = attrs
     return attrs
+
+  def update_official_name(self, name: str) -> None:
+    """Update the official name."""
+    if (self._official_name is None or
+        name == self.name or
+        (self._official_name != self.name and name < self._official_name)):
+      # The lexical comparison is to ensure that, in the case of multiple calls
+      # to this method, the official name does not depend on the call order.
+      self._official_name = name
+      for member_var in self.members.values():
+        for member in member_var.data:
+          if isinstance(member, Class):
+            member.update_official_name(f"{name}.{member.name}")

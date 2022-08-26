@@ -1,7 +1,7 @@
 """Tests for @abc.abstractmethod in abc_overlay.py."""
 
-from pytype import file_utils
 from pytype.tests import test_base
+from pytype.tests import test_utils
 
 
 class AbstractMethodTests(test_base.BaseTest):
@@ -108,7 +108,7 @@ class AbstractMethodTests(test_base.BaseTest):
     # When a function parameter is annotated as `Type[A]`, where A is abstract,
     # presumably the intent is for callers to pass in concrete subclasses of A,
     # so we should not raise an error if A is instantiated in the body.
-    with file_utils.Tempdir() as d:
+    with test_utils.Tempdir() as d:
       d.create_file("foo.pyi", """
         import abc
         class A(metaclass=abc.ABCMeta):
@@ -163,6 +163,25 @@ class AbstractMethodTests(test_base.BaseTest):
         def f(cls) -> str: ...  # bad-return-type
     """)
     self.assertErrorSequences(errors, {"e": ["on method Foo.f"]})
+
+  def test_abstract_property(self):
+    # Regression test for a crash when the decorators were applied in the wrong
+    # order.
+    errors = self.CheckWithErrors("""
+      import abc
+      class Foo(abc.ABC):
+        @abc.abstractmethod
+        @property
+        def f(self) -> str:  # wrong-arg-types[e]
+          return 'a'
+
+        @property
+        @abc.abstractmethod
+        def g(self) -> str:
+          return 'a'
+    """)
+    self.assertErrorSequences(
+        errors, {"e": ["Expected", "Callable", "Actual", "property"]})
 
 
 if __name__ == "__main__":

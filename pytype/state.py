@@ -3,8 +3,9 @@
 import collections
 import itertools
 import logging
-from typing import Collection, Dict, Optional
+from typing import Any, Collection, Dict, Optional, Tuple, Union
 
+from pytype import blocks
 from pytype import compare
 from pytype import metrics
 from pytype import utils
@@ -17,6 +18,10 @@ log = logging.getLogger(__name__)
 # A special constant, returned by split_conditions() to signal that the
 # condition cannot be satisfied with any known bindings.
 UNSATISFIABLE = object()
+
+FrameType = Union["SimpleFrame", "Frame"]
+# This should be context.Context, which can't be imported due to a circular dep.
+_ContextType = Any
 
 
 class FrameState(utils.ContextWeakrefMixin):
@@ -95,8 +100,7 @@ class FrameState(utils.ContextWeakrefMixin):
     return FrameState(self.data_stack, self.block_stack[:-1], self.node,
                       self.ctx, self.exception, self.why), block
 
-  def change_cfg_node(self, node):
-    assert isinstance(node, cfg.CFGNode)
+  def change_cfg_node(self, node: cfg.CFGNode) -> "FrameState":
     if self.node is node:
       return self
     return FrameState(self.data_stack, self.block_stack, node, self.ctx,
@@ -128,9 +132,6 @@ class FrameState(utils.ContextWeakrefMixin):
       return self
     assert len(self.data_stack) == len(other.data_stack)
     assert len(self.block_stack) == len(other.block_stack)
-    node = other.node
-    if self.node is not node:
-      self.node.ConnectTo(node)
     both = list(zip(self.data_stack, other.data_stack))
     if any(v1 is not v2 for v1, v2 in both):
       for v, o in both:
@@ -197,9 +198,13 @@ class Frame(utils.ContextWeakrefMixin):
     yield_variable: The yield value of this function, as a Variable.
   """
 
-  def __init__(self, node, ctx, f_code, f_globals, f_locals, f_back, callargs,
-               closure, func, first_arg: Optional[cfg.Variable],
-               substs: Collection[Dict[str, cfg.Variable]]):
+  def __init__(
+      self, node: cfg.CFGNode, ctx: _ContextType, f_code: blocks.OrderedCode,
+      f_globals: abstract.LazyConcreteDict, f_locals: abstract.LazyConcreteDict,
+      f_back: FrameType, callargs: Dict[str, cfg.Variable],
+      closure: Optional[Tuple[cfg.Variable, ...]], func: Optional[cfg.Binding],
+      first_arg: Optional[cfg.Variable],
+      substs: Collection[Dict[str, cfg.Variable]]):
     """Initialize a special frame as needed by TypegraphVirtualMachine.
 
     Args:
@@ -212,7 +217,7 @@ class Frame(utils.ContextWeakrefMixin):
       f_back: The frame above this one on the stack.
       callargs: Additional function arguments to store in f_locals.
       closure: A tuple containing the new co_freevars.
-      func: An Optional[cfg.Binding] to the function this frame corresponds to.
+      func: Optionally, a binding to the function this frame corresponds to.
       first_arg: First argument to the function.
       substs: Maps from type parameter names in scope for this frame to their
         possible values.
@@ -220,8 +225,6 @@ class Frame(utils.ContextWeakrefMixin):
       NameError: If we can't resolve any references into the outer frame.
     """
     super().__init__(ctx)
-    assert isinstance(f_globals, abstract.LazyConcreteDict)
-    assert isinstance(f_locals, abstract.LazyConcreteDict)
     self.node = node
     self.current_opcode = None
     self.f_code = f_code
